@@ -1,0 +1,97 @@
+[package]
+name = "rars"
+version = "0.12.3"
+description = "High-level Rust API for reading, extracting, writing, and repairing RAR archives."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+# Default builds retain all capabilities; each optional feature is independent.
+default = ["write", "parallel", "recovery", "encryption"]
+# Compatibility alias: exact matching and bounded pricing state are standard with write.
+experimental-ring-state = ["write"]
+parallel = ["dep:rayon"]
+recovery = ["dep:getrandom"]
+write = ["dep:getrandom"]
+encryption = ["dep:aes", "dep:hmac", "dep:sha1", "dep:sha2", "dep:zeroize"]
+
+[dependencies]
+aes = { workspace = true, optional = true }
+aho-corasick.workspace = true
+crc32fast.workspace = true
+getrandom = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+sha1 = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+# Bare WebAssembly cannot start a thread, so rayon's pool panics rather than
+# running sequentially. `parallel.rs` has a single-threaded path for that target
+# and rayon is left out of the build entirely.
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+rayon = { workspace = true, optional = true }
+
+# `getrandom` has no default entropy source on bare WebAssembly. RAR 5 header
+# encryption needs one, so point it at the host's `crypto.getRandomValues`. The
+# matching `--cfg getrandom_backend="wasm_js"` lives in `.cargo/config.toml`.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
+
+# Native filename tests distinguish EILSEQ from unrelated filesystem failures.
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "chunk_sizes"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "parallel"
+harness = false
+required-features = ["write", "parallel"]
+
+[[bench]]
+name = "member_lookup"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "huffman_tables"
+harness = false
+
+[[bench]]
+name = "streaming_decode"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "rar50_hash"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "huffman_decode"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "rar20_decode"
+harness = false
+required-features = ["write"]

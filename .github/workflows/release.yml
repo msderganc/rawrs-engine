@@ -1,0 +1,601 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+      - "v*.*.*-*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or ref to publish"
+        required: true
+        default: "v0.12.3"
+      publish:
+        description: "Release path to run"
+        required: true
+        default: "pypi"
+        type: choice
+        options:
+          - pypi
+          - npm
+          - all
+
+# Default deny; each job re-grants only what it needs.
+permissions: {}
+
+# Releases must never be cancelled mid-flight.
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: rars
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+
+jobs:
+  # ----------------------------------------------------------------------
+  # 1. Verify the tag matches every publishable package version. Refuse to
+  #    publish v0.1.0-alpha.1 if any crate still declares a different
+  #    package version.
+  # ----------------------------------------------------------------------
+  verify-tag:
+    name: Verify tag matches workspace package versions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - id: check
+        name: Check versions
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_REF##*/}"            # v0.1.0-alpha.1
+          TAG_VERSION="${TAG#v}"              # 0.1.0-alpha.1
+          echo "tag = $TAG_VERSION"
+
+          cargo metadata --locked --no-deps --format-version 1 > metadata.json
+          python3 - <<'PY' "$TAG_VERSION"
+          import json
+          import sys
+
+          tag_version = sys.argv[1]
+          metadata = json.load(open("metadata.json", encoding="utf-8"))
+          packages = sorted(
+              (package["name"], package["version"])
+              for package in metadata["packages"]
+          )
+          mismatches = [
+              (name, version)
+              for name, version in packages
+              if version != tag_version
+          ]
+          for name, version in packages:
+              print(f"{name} = {version}")
+          if mismatches:
+              for name, version in mismatches:
+                  print(
+                      f"::error::{name} version {version} does not match tag {tag_version}"
+                  )
+              raise SystemExit(1)
+
+          with open("pyproject.toml", "rb") as f:
+              pyproject = __import__("tomllib").load(f)
+          py_version = pyproject["project"]["version"]
+          print(f"pyproject = {py_version}")
+          if py_version != tag_version:
+              print(
+                  f"::error::pyproject version {py_version} does not match tag {tag_version}"
+              )
+              raise SystemExit(1)
+          PY
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+
+  # ----------------------------------------------------------------------
+  # 2. Re-run the suite as a release gate. Nothing else runs unless this is
+  #    green.
+  # ----------------------------------------------------------------------
+  test:
+    name: Test gate
+    needs: verify-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The write matrix hands every archive shape to a decoder we did not
+      # write. It is pinned and checksummed, and comes from upstream because
+      # the Debian and Ubuntu package has the RAR decompressor removed. A
+      # reference decoder joins it only where RAR_DECODER names one.
+      - name: Install 7-Zip
+        run: |
+          set -euo pipefail
+          curl -sSfLO https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x64.tar.xz
+          echo "c74dc4a48492cde43f5fec10d53fb2a66f520e4a62a69d630c44cb22c477edc6  7z2600-linux-x64.tar.xz" | sha256sum -c -
+          mkdir -p 7zip && tar -C 7zip -xf 7z2600-linux-x64.tar.xz
+          sudo install -m 0755 7zip/7zz /usr/local/bin/7zz
+          7zz | head -2
+
+      # Python 3.10 is what the wheels target, so the gate builds the extension
+      # against the oldest version it claims to support.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      # The gate also builds the npm package and runs its checks, which needs a
+      # wasm target, wasm-bindgen and Node. The wasm-bindgen version has to
+      # match the crate the module was compiled against or the generated glue
+      # will not load it, so it is pinned here and in Cargo.lock together.
+      - name: Install wasm toolchain
+        run: |
+          set -euo pipefail
+          rustup target add wasm32-unknown-unknown
+          WASM_BINDGEN_VERSION="$(python3 scripts/wasm-bindgen-version.py)"
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+          npm install --global binaryen@132
+          wasm-bindgen --version
+          wasm-opt --version
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      # The same script `just gate` runs. Spelling the steps out here again is
+      # how the Python suite came to run in neither place: it was added to the
+      # script nobody called, and CI had its own copy of the cargo commands that
+      # knew nothing about it. One list, two callers.
+      #
+      # RARS_REQUIRE_EXTERNAL_DECODERS is set inside the script, so a missing
+      # decoder fails the gate rather than skipping the matrix.
+      - run: ./scripts/release-gate.sh
+
+  # ----------------------------------------------------------------------
+  # 3. Build release binaries for the supported targets.
+  # ----------------------------------------------------------------------
+  build:
+    name: Build ${{ matrix.label }}
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'all'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          - label: linux-aarch64-musl
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            setup: sudo apt-get update && sudo apt-get install -y musl-tools
+          - label: macos-universal
+            os: macos-latest
+            target: universal2-apple-darwin
+            setup: ""
+          - label: windows-x86_64-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            setup: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # macOS universal needs both Apple targets; everything else just
+          # needs its own.
+          targets: ${{ matrix.target == 'universal2-apple-darwin' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Platform setup
+        if: matrix.setup != ''
+        shell: bash
+        run: ${{ matrix.setup }}
+
+      # ---- Linux + Windows: build for the single target. ----
+      - name: Build (single target)
+        if: matrix.target != 'universal2-apple-darwin'
+        shell: bash
+        run: |
+          cargo build --release --locked -p rars-cli --bin ${{ env.BIN_NAME }} --target ${{ matrix.target }}
+
+      # ---- macOS: build twice, lipo into one universal binary. ----
+      - name: Build (macOS universal)
+        if: matrix.target == 'universal2-apple-darwin'
+        run: |
+          cargo build --release --locked -p rars-cli --bin ${{ env.BIN_NAME }} --target x86_64-apple-darwin
+          cargo build --release --locked -p rars-cli --bin ${{ env.BIN_NAME }} --target aarch64-apple-darwin
+          mkdir -p target/universal2-apple-darwin/release
+          lipo -create \
+            target/x86_64-apple-darwin/release/${{ env.BIN_NAME }} \
+            target/aarch64-apple-darwin/release/${{ env.BIN_NAME }} \
+            -output target/universal2-apple-darwin/release/${{ env.BIN_NAME }}
+          file target/universal2-apple-darwin/release/${{ env.BIN_NAME }}
+
+      # ---- Stage the binary into a release dir alongside LICENSE etc. ----
+      - name: Stage release files (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          STAGE="${{ env.BIN_NAME }}-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}"
+          mkdir -p "dist/$STAGE"
+          cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "dist/$STAGE/"
+          if [ -f LICENSE ]; then cp LICENSE "dist/$STAGE/"; fi
+          if [ -f README.md ]; then cp README.md "dist/$STAGE/"; fi
+          tar -C dist -czf "dist/$STAGE.tar.gz" "$STAGE"
+          ls -la dist/
+
+      - name: Stage release files (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stage = "$env:BIN_NAME-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}"
+          New-Item -ItemType Directory -Path "dist\$stage" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\$env:BIN_NAME.exe" "dist\$stage\"
+          if (Test-Path LICENSE)   { Copy-Item LICENSE   "dist\$stage\" }
+          if (Test-Path README.md) { Copy-Item README.md "dist\$stage\" }
+          Compress-Archive -Path "dist\$stage" -DestinationPath "dist\$stage.zip"
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BIN_NAME }}-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 4. Publish public crates to crates.io in dependency order. Requires the
+  #    `release` environment so CARGO_REGISTRY_TOKEN is reachable. Configure
+  #    that environment in GitHub repo settings and put the token there.
+  # ----------------------------------------------------------------------
+  publish-crates:
+    name: Publish crates to crates.io
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish crates
+        run: |
+          set -euo pipefail
+
+          publish() {
+            local package="$1"
+            local log
+            log="$(mktemp)"
+            echo "::group::Publishing $package"
+            for attempt in 1 2 3 4 5; do
+              if cargo publish --locked -p "$package" 2>&1 | tee "$log"; then
+                echo "::endgroup::"
+                rm -f "$log"
+                return 0
+              fi
+              if grep -Eq "crate .+@.+ already exists on crates.io index|crate version .+ is already uploaded" "$log"; then
+                echo "$package is already published; continuing"
+                echo "::endgroup::"
+                rm -f "$log"
+                return 0
+              fi
+              if [ "$attempt" = 5 ]; then
+                echo "::endgroup::"
+                rm -f "$log"
+                return 1
+              fi
+              echo "Publish failed for $package; waiting for registry/index propagation before retry $((attempt + 1))"
+              sleep 30
+            done
+            echo "::endgroup::"
+            rm -f "$log"
+          }
+
+          publish rars
+          publish rars-cli
+
+  # ----------------------------------------------------------------------
+  # 5. Build Python wheels and an sdist for PyPI. The Python extension uses
+  #    abi3-py310, so one wheel per OS/architecture covers CPython 3.10+.
+  # ----------------------------------------------------------------------
+  build-python-wheels:
+    name: Build Python ${{ matrix.label }}
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: "2014"
+          - label: linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            manylinux: "2014"
+          - label: macos-universal2
+            os: macos-latest
+            target: universal2-apple-darwin
+            manylinux: "off"
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: >-
+            --release
+            --locked
+            --compatibility pypi
+            --out dist
+
+      - name: Upload Python artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ needs.verify-tag.outputs.version }}-${{ matrix.label }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-python-sdist:
+    name: Build Python sdist
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - name: Upload Python sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-${{ needs.verify-tag.outputs.version }}-sdist
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 5b. Build the npm package. One WebAssembly module serves every platform,
+  #     so unlike the wheels this is a single job with no matrix.
+  # ----------------------------------------------------------------------
+  build-npm:
+    name: Build npm package
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install wasm tooling
+        run: |
+          set -euo pipefail
+          WASM_BINDGEN_VERSION="$(python3 scripts/wasm-bindgen-version.py)"
+          cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+          npm install --global binaryen@132
+
+      - run: ./scripts/build-npm.sh
+
+      # Building and testing in one job so the tarball that gets published is
+      # the one the checks ran against, byte for byte.
+      - run: node scripts/test-npm-package.js
+
+      - name: Pack
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          npm pack --pack-destination dist ./npm
+          ls -la dist/
+
+      - name: Upload npm artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-${{ needs.verify-tag.outputs.version }}
+          path: dist/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 6. Publish Python wheels and sdist to PyPI using Trusted Publishing.
+  #    Configure the `release` environment as a PyPI trusted publisher.
+  # ----------------------------------------------------------------------
+  publish-pypi:
+    name: Publish Python package to PyPI
+    needs: [verify-tag, build-python-wheels, build-python-sdist, publish-crates]
+    if: >-
+      always()
+      && needs.verify-tag.result == 'success'
+      && needs.build-python-wheels.result == 'success'
+      && needs.build-python-sdist.result == 'success'
+      && (
+        needs.publish-crates.result == 'success'
+        || (github.event_name == 'workflow_dispatch' && inputs.publish == 'pypi' && needs.publish-crates.result == 'skipped')
+      )
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download Python artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: python-${{ needs.verify-tag.outputs.version }}-*
+          merge-multiple: true
+
+      - name: Publish Python package
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  # ----------------------------------------------------------------------
+  # 6b. Publish the npm package.
+  #
+  #     npm trusted publishing needs the package to already exist and to have
+  #     this repository registered as its publisher, so the very first version
+  #     goes up by hand with `npm publish` and every later one comes from here.
+  #     `id-token: write` is what mints the provenance attestation.
+  # ----------------------------------------------------------------------
+  publish-npm:
+    name: Publish npm package
+    needs: [verify-tag, build-npm]
+    if: github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm 11.5.1 or newer to mint the OIDC token.
+      # Node 22 ships npm 10.
+      - name: Update npm
+        run: npm install --global npm@latest
+
+      - name: Download npm artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: npm-${{ needs.verify-tag.outputs.version }}
+          path: dist
+
+      # No token: npm trusted publishing exchanges the workflow's OIDC identity
+      # for a short-lived credential, and attaches a provenance attestation
+      # saying which commit and workflow built the tarball. Set that up once, in
+      # the package's settings on npmjs.com, pointing at this repository and
+      # this workflow file. NPM_TOKEN is the fallback for when that is not
+      # configured yet.
+      #
+      # Republishing a version npm already has is an error, and a re-run of a
+      # release should not fail on it, so ask first.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "@bitplane/rars@$VERSION" version >/dev/null 2>&1; then
+            echo "@bitplane/rars@$VERSION is already published; nothing to do"
+            exit 0
+          fi
+          # The leading ./ is load-bearing. npm parses a bare `dist/foo.tgz` as
+          # the git shorthand `github:dist/foo.tgz` and refuses it with
+          # EALLOWGIT; only an explicit relative or absolute path is read as a
+          # file. npm pack flattens the scope into the filename.
+          npm publish --provenance --access public "./dist/bitplane-rars-$VERSION.tgz"
+
+  # ----------------------------------------------------------------------
+  # 7. Publish the packaged binaries to the tagged GitHub Release.
+  # ----------------------------------------------------------------------
+  publish-github-release:
+    name: Publish GitHub Release
+    needs: [verify-tag, build, publish-crates, publish-pypi, publish-npm]
+    if: github.event_name == 'push' || inputs.publish == 'all'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ env.BIN_NAME }} ${{ needs.verify-tag.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ contains(needs.verify-tag.outputs.version, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.whl
+            dist/*.tgz

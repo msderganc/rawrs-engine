@@ -1,0 +1,91 @@
+[package]
+name = "rars-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rars = { path = "../crates/rars" }
+
+[[bin]]
+name = "archive_parse"
+path = "fuzz_targets/archive_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack29_decode"
+path = "fuzz_targets/unpack29_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ppmd_decode"
+path = "fuzz_targets/ppmd_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rarvm_parse_execute"
+path = "fuzz_targets/rarvm_parse_execute.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack50_decode"
+path = "fuzz_targets/unpack50_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar5_recovery"
+path = "fuzz_targets/rar5_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar3_recovery"
+path = "fuzz_targets/rar3_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar50_crypto"
+path = "fuzz_targets/rar50_crypto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rar30_crypto"
+path = "fuzz_targets/rar30_crypto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "unpack15_round_trip"
+path = "fuzz_targets/unpack15_round_trip.rs"
+test = false
+doc = false
+bench = false

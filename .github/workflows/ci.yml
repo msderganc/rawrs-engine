@@ -1,0 +1,208 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  msrv:
+    name: Minimum Rust (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Name the toolchain as an input: Dependabot treats a version in the
+      # action ref as the action's own version and "upgrades" it.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Check workspace and independent readers at the minimum compiler version
+        run: |
+          cargo check --workspace --lib --bins --locked
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --features encryption
+
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # The workspace includes PyO3 tests that embed Python.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path scripts/reader-consumer/Cargo.toml -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Includes unit, integration and doc tests, but does not run benchmarks.
+      # External-decoder tests skip unavailable tools; the release gate requires them.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Frozen runner real-binary smoke and portable checks
+        env:
+          RARS_SMOKE_BINARY: ${{ github.workspace }}/target/debug/rars
+        run: |
+          cargo build -p rars-cli --locked
+          python3 -m unittest discover -s scripts/hybrid -v
+
+  native-cli:
+    name: Native CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    env:
+      CARGO_BUILD_JOBS: 2
+      RUST_TEST_THREADS: 2
+      RAYON_NUM_THREADS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the CLI on the native filesystem
+        run: cargo test -p rars-cli --locked
+
+  reader-features:
+    name: Independent reader feature matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      RUST_TEST_THREADS: 2
+      RAYON_NUM_THREADS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Fetch locked dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path scripts/reader-consumer/Cargo.toml
+      - name: Check independent reader consumer and dependency exclusions
+        run: python3 scripts/check-reader-features.py
+
+  reader-targets:
+    name: Reader target (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wasm32-unknown-unknown, i686-unknown-linux-musl]
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Check minimal and encrypted readers without workspace unification
+        run: |
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target '${{ matrix.target }}'
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target '${{ matrix.target }}' --features encryption
+      - name: Check full library
+        run: cargo check -p rars --lib --locked --target '${{ matrix.target }}'
+
+  portable-atomics:
+    name: Library and CLI without 64-bit atomics
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: powerpc-unknown-linux-gnu
+      # Criterion's alloca dependency builds C even during cargo check.
+      - name: Install PowerPC C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc-linux-gnu
+      # Compile the binary and tests on a target that exercises the mutex
+      # fallback, without needing an emulator to run them.
+      - name: Check library, CLI and tests
+        run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
+
+  unit-features:
+    name: Library unit features (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        features:
+          - none
+          - parallel
+          - encryption
+          - encryption,parallel
+          - recovery
+          - recovery,parallel
+          - recovery,encryption
+          - recovery,encryption,parallel
+          - write
+          - write,parallel
+          - write,encryption
+          - write,encryption,parallel
+          - write,recovery
+          - write,recovery,parallel
+          - write,recovery,encryption
+          - write,recovery,encryption,parallel
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      RUST_TEST_THREADS: 2
+      RAYON_NUM_THREADS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test the library without workspace feature unification
+        run: python3 scripts/check-unit-features.py --features '${{ matrix.features }}'
+      - name: Check encoder memory bounds without workspace feature unification
+        if: matrix.features == 'write' || matrix.features == 'write,parallel'
+        run: cargo test -p rars --locked --no-default-features --features '${{ matrix.features }}' --test encoder_memory_regression

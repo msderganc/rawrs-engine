@@ -1,0 +1,3076 @@
+use pyo3::exceptions::{
+    PyInterruptedError, PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyValueError,
+};
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList, PyModule};
+use pyo3::{create_exception, PyErr};
+use rars_rs::filename::relative_path as output_relative_path;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+#[cfg(test)]
+#[path = "../../rars/tests/support/scratch.rs"]
+mod scratch;
+
+create_exception!(rars, Error, pyo3::exceptions::PyException);
+create_exception!(rars, BadRarFile, Error);
+create_exception!(rars, BadPassword, BadRarFile);
+create_exception!(rars, PasswordRequired, BadRarFile);
+create_exception!(rars, UnsupportedRarFeature, Error);
+create_exception!(rars, UnsafeArchivePath, Error);
+
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone)]
+struct ProgressEvent {
+    #[pyo3(get)]
+    phase: String,
+    #[pyo3(get)]
+    completed: u64,
+    #[pyo3(get)]
+    total: u64,
+    #[pyo3(get)]
+    pass_number: usize,
+    #[pyo3(get)]
+    entry_name: Option<Vec<u8>>,
+    #[pyo3(get)]
+    entry_index: Option<usize>,
+    #[pyo3(get)]
+    total_entries: Option<usize>,
+    finished: bool,
+}
+
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone)]
+struct RepairReport {
+    #[pyo3(get)]
+    changed: bool,
+    #[pyo3(get)]
+    data_repaired: bool,
+    #[pyo3(get)]
+    recovery_record_rebuilt: bool,
+    #[pyo3(get)]
+    end_record_rebuilt: bool,
+    #[pyo3(get)]
+    available_recovery_shards: Option<u64>,
+    #[pyo3(get)]
+    expected_recovery_shards: Option<u64>,
+}
+
+impl From<rars_rs::RecoveryRepairReport> for RepairReport {
+    fn from(value: rars_rs::RecoveryRepairReport) -> Self {
+        Self {
+            changed: value.changed,
+            data_repaired: value.data_repaired,
+            recovery_record_rebuilt: value.recovery_record_rebuilt,
+            end_record_rebuilt: value.end_record_rebuilt,
+            available_recovery_shards: value.available_recovery_shards,
+            expected_recovery_shards: value.expected_recovery_shards,
+        }
+    }
+}
+
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+struct RepairResult {
+    #[pyo3(get)]
+    data: Vec<u8>,
+    #[pyo3(get)]
+    report: RepairReport,
+}
+
+#[pymethods]
+impl ProgressEvent {
+    #[getter]
+    fn percentage(&self) -> Option<f64> {
+        if self.phase == "writing" && self.total == 0 && !self.finished {
+            return None;
+        }
+        if self.total == 0 {
+            Some(100.0)
+        } else {
+            Some(self.completed as f64 * 100.0 / self.total as f64)
+        }
+    }
+}
+
+/// A thread-safe, one-way cancellation signal for reading, writing and repair.
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone, Default)]
+struct CancellationToken {
+    inner: rars_rs::ReadCancellation,
+}
+
+#[pymethods]
+impl CancellationToken {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation. A cancelled token cannot be reset.
+    fn cancel(&self) {
+        self.inner.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.inner.is_cancelled()
+    }
+}
+
+/// Per-call parsing, decoding and extraction policies.
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone, Default)]
+struct ReadOptions {
+    #[pyo3(get)]
+    legacy_name_encoding: Option<String>,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    cancellation: Option<rars_rs::ReadCancellation>,
+    #[pyo3(get)]
+    max_member_output_bytes: Option<u64>,
+    #[pyo3(get)]
+    max_total_output_bytes: Option<u64>,
+    #[pyo3(get)]
+    max_reader_workspace_bytes: Option<u64>,
+    #[pyo3(get)]
+    max_header_count: Option<u64>,
+    #[pyo3(get)]
+    max_header_bytes: Option<u64>,
+    #[pyo3(get)]
+    rar50_dictionary_size_limit: Option<u64>,
+    #[pyo3(get)]
+    rar50_buffered_decode_limit: Option<u64>,
+}
+
+#[pymethods]
+impl ReadOptions {
+    #[new]
+    #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None))]
+    fn new(
+        cancellation: Option<&CancellationToken>,
+        max_member_output_bytes: Option<u64>,
+        max_total_output_bytes: Option<u64>,
+        max_reader_workspace_bytes: Option<u64>,
+        rar50_dictionary_size_limit: Option<u64>,
+        rar50_buffered_decode_limit: Option<u64>,
+        max_header_count: Option<u64>,
+        max_header_bytes: Option<u64>,
+        legacy_name_encoding: Option<String>,
+    ) -> PyResult<Self> {
+        let encoding = legacy_name_encoding
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(map_error)?;
+        Ok(Self {
+            legacy_name_encoding,
+            encoding,
+            cancellation: cancellation.map(|token| token.inner.clone()),
+            max_member_output_bytes,
+            max_total_output_bytes,
+            max_reader_workspace_bytes,
+            rar50_dictionary_size_limit,
+            rar50_buffered_decode_limit,
+            max_header_count,
+            max_header_bytes,
+        })
+    }
+
+    #[getter]
+    fn cancellation(&self) -> Option<CancellationToken> {
+        self.cancellation.as_ref().map(|inner| CancellationToken {
+            inner: inner.clone(),
+        })
+    }
+}
+
+fn python_read_options<'a>(
+    settings: Option<&'a ReadOptions>,
+    password: Option<&'a [u8]>,
+) -> rars_rs::ArchiveReadOptions<'a> {
+    let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
+    if let Some(settings) = settings {
+        options.cancellation = settings.cancellation.as_ref();
+        options.legacy_name_encoding = settings.encoding;
+        options.max_header_count = settings.max_header_count;
+        options.max_header_bytes = settings.max_header_bytes;
+        options.max_member_output_bytes = settings.max_member_output_bytes;
+        options.max_total_output_bytes = settings.max_total_output_bytes;
+        options.max_reader_workspace_bytes = settings.max_reader_workspace_bytes;
+        options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
+        options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
+    }
+    options
+}
+
+struct PythonProgress {
+    callback: Option<Py<PyAny>>,
+    state: Mutex<HashMap<&'static str, ProgressEvent>>,
+    error: Mutex<Option<PyErr>>,
+    cancelled: AtomicBool,
+    read_cancellation: rars_rs::ReadCancellation,
+}
+
+impl PythonProgress {
+    fn new(callback: Option<Py<PyAny>>, cancellation: Option<&CancellationToken>) -> Self {
+        Self {
+            callback,
+            state: Mutex::new(HashMap::new()),
+            error: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            read_cancellation: cancellation
+                .map_or_else(rars_rs::ReadCancellation::new, |token| token.inner.child()),
+        }
+    }
+
+    fn take_error(&self) -> Option<PyErr> {
+        self.error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+}
+
+impl rars_rs::WriteProgress for PythonProgress {
+    fn report(&self, event: rars_rs::WriteProgressEvent<'_>) {
+        if self.cancelled.load(Ordering::Relaxed) || self.read_cancellation.is_cancelled() {
+            return;
+        }
+        let Some(callback) = &self.callback else {
+            return;
+        };
+        let snapshot = {
+            let operation = match event {
+                rars_rs::WriteProgressEvent::OperationStarted { operation, .. }
+                | rars_rs::WriteProgressEvent::EntryStarted { operation, .. }
+                | rars_rs::WriteProgressEvent::EntryFinished { operation, .. }
+                | rars_rs::WriteProgressEvent::Advanced { operation, .. }
+                | rars_rs::WriteProgressEvent::OperationFinished { operation, .. } => operation,
+                _ => rars_rs::WriteOperation::Emission,
+            };
+            let phase = progress_phase(operation);
+            let mut states = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = states.entry(phase).or_insert_with(|| ProgressEvent {
+                phase: phase.to_string(),
+                completed: 0,
+                total: 0,
+                pass_number: 1,
+                entry_name: None,
+                entry_index: None,
+                total_entries: None,
+                finished: false,
+            });
+            match event {
+                rars_rs::WriteProgressEvent::OperationStarted {
+                    operation,
+                    total_bytes,
+                    total_entries,
+                    pass,
+                } => {
+                    state.phase = progress_phase(operation).to_string();
+                    state.finished = false;
+                    state.completed = 0;
+                    state.total = total_bytes.unwrap_or(0);
+                    state.pass_number = pass;
+                    state.total_entries = total_entries;
+                    state.entry_name = None;
+                    state.entry_index = None;
+                }
+                rars_rs::WriteProgressEvent::EntryStarted {
+                    index,
+                    total_entries,
+                    name,
+                    ..
+                }
+                | rars_rs::WriteProgressEvent::EntryFinished {
+                    index,
+                    total_entries,
+                    name,
+                    ..
+                } => {
+                    state.entry_name = Some(name.to_vec());
+                    state.entry_index = Some(index);
+                    state.total_entries = Some(total_entries);
+                }
+                rars_rs::WriteProgressEvent::Advanced {
+                    operation,
+                    completed_bytes,
+                    total_bytes,
+                    pass,
+                } => {
+                    state.phase = progress_phase(operation).to_string();
+                    state.completed = completed_bytes;
+                    state.total = total_bytes;
+                    state.pass_number = pass;
+                }
+                rars_rs::WriteProgressEvent::VolumeFinished { bytes, .. } => {
+                    state.finished = true;
+                    state.completed = bytes;
+                    state.total = bytes;
+                }
+                rars_rs::WriteProgressEvent::BytesWritten { completed_bytes } => {
+                    state.completed = completed_bytes;
+                }
+                rars_rs::WriteProgressEvent::OperationFinished {
+                    operation,
+                    total_bytes,
+                    pass,
+                    ..
+                } => {
+                    state.phase = progress_phase(operation).to_string();
+                    state.finished = true;
+                    state.total = total_bytes.unwrap_or(state.total);
+                    state.completed = state.total;
+                    state.pass_number = pass;
+                }
+                _ => {}
+            }
+            state.clone()
+        };
+        let result = Python::attach(|py| {
+            let event = Py::new(py, snapshot)?;
+            callback.call1(py, (event,)).map(|_| ())
+        });
+        if let Err(error) = result {
+            self.cancelled.store(true, Ordering::Relaxed);
+            self.read_cancellation.cancel();
+            *self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed) || self.read_cancellation.is_cancelled()
+    }
+}
+
+fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
+    match operation {
+        rars_rs::WriteOperation::Staging => "staging",
+        rars_rs::WriteOperation::Compression => "compression",
+        rars_rs::WriteOperation::Recovery => "recovery",
+        _ => "writing",
+    }
+}
+
+#[pyclass(frozen, module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone)]
+struct RarInfo {
+    #[pyo3(get)]
+    member_index: usize,
+    archive_identity: Option<Arc<()>>,
+    #[pyo3(get)]
+    filename: String,
+    orig_filename_bytes: Arc<[u8]>,
+    #[pyo3(get)]
+    file_size: u64,
+    #[pyo3(get)]
+    compress_size: u64,
+    #[pyo3(get)]
+    /// Whole-second calendar tuple: UTC for RAR5, stored wall-clock fields for
+    /// legacy DOS timestamps. None means no usable timestamp was recorded.
+    date_time: Option<(u16, u8, u8, u8, u8, u8)>,
+    #[pyo3(get)]
+    crc: Option<u32>,
+    #[pyo3(get)]
+    host_os: Option<u64>,
+    #[pyo3(get)]
+    is_encrypted: bool,
+    #[pyo3(get)]
+    is_solid: bool,
+    #[pyo3(get)]
+    is_split_before: bool,
+    #[pyo3(get)]
+    is_split_after: bool,
+    #[pyo3(get)]
+    rar_version: String,
+    #[pyo3(get)]
+    file_attr: u64,
+    #[pyo3(get)]
+    detail: HashMap<String, String>,
+    is_directory: bool,
+}
+
+#[pymethods]
+impl RarInfo {
+    #[getter]
+    fn orig_filename_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.orig_filename_bytes)
+    }
+
+    #[getter(CRC)]
+    fn crc_upper(&self) -> Option<u32> {
+        self.crc
+    }
+
+    fn is_dir(&self) -> bool {
+        self.is_directory
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RarInfo(filename={:?}, file_size={}, compress_size={})",
+            self.filename, self.file_size, self.compress_size
+        )
+    }
+}
+
+#[pyclass(module = "rars", skip_from_py_object)]
+struct RarFile {
+    identity: Arc<()>,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    archive: rars_rs::Archive,
+    password: Option<Vec<u8>>,
+    infos: Vec<RarInfo>,
+    names: OnceLock<MemberNames>,
+}
+
+#[derive(Default)]
+struct MemberNames {
+    raw: HashMap<Arc<[u8]>, usize>,
+    decoded: HashMap<String, Option<usize>>,
+}
+
+impl MemberNames {
+    fn new(infos: &[RarInfo], decoded: bool) -> Self {
+        let mut names = Self::default();
+        for (index, info) in infos.iter().enumerate() {
+            names.raw.insert(info.orig_filename_bytes.clone(), index);
+            if decoded {
+                names
+                    .decoded
+                    .entry(info.filename.clone())
+                    .and_modify(|previous| {
+                        if previous.is_some_and(|previous| {
+                            infos[previous].orig_filename_bytes == info.orig_filename_bytes
+                        }) {
+                            *previous = Some(index);
+                        } else {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(Some(index));
+            }
+        }
+        names
+    }
+}
+
+#[pymethods]
+impl RarFile {
+    #[new]
+    #[pyo3(signature = (source, mode = "r", password = None, *, options = None))]
+    fn new(
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        mode: &str,
+        password: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Self> {
+        if mode != "r" {
+            return Err(PyNotImplementedError::new_err(
+                "RarFile currently opens archives for reading; use RarBuilder to create or rewrite archives",
+            ));
+        }
+        let password = py_password(password)?;
+        let token = options.and_then(ReadOptions::cancellation);
+        let bytes = py_input_bytes_with_cancellation(py, source, token.as_ref())?;
+        Self::from_bytes(py, bytes, password, options)
+    }
+
+    #[staticmethod]
+    #[pyo3(name = "from_bytes")]
+    #[pyo3(signature = (data, password = None, *, options = None))]
+    fn from_bytes_py(
+        py: Python<'_>,
+        data: Vec<u8>,
+        password: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Self> {
+        Self::from_bytes(py, data, py_password(password)?, options)
+    }
+
+    fn namelist(&self) -> Vec<String> {
+        self.infos
+            .iter()
+            .map(|info| info.filename.clone())
+            .collect()
+    }
+
+    fn infolist(&self) -> Vec<RarInfo> {
+        self.infos.clone()
+    }
+
+    fn getinfo(&self, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
+        Ok(self.infos[self.resolve_index(name)?].clone())
+    }
+
+    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    fn read(
+        &self,
+        py: Python<'_>,
+        name: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Vec<u8>> {
+        check_read_options_cancellation(options)?;
+        let index = self.resolve_index(name)?;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| {
+            self.archive.read_member_at_with_options(
+                index,
+                self.extraction_options(options, password.as_deref()),
+            )
+        })
+        .map_err(map_error)?
+        .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
+    }
+
+    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    fn open(
+        &self,
+        py: Python<'_>,
+        name: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Py<PyAny>> {
+        let data = self.read(py, name, pwd, options)?;
+        let io = py.import("io")?;
+        let bytes = PyBytes::new(py, &data);
+        Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
+    }
+
+    /// Read selected members in one session, preserving request order and duplicates.
+    /// Output limits apply to the whole call, including required solid predecessors.
+    #[pyo3(signature = (members, pwd = None, *, options = None))]
+    fn read_many(
+        &self,
+        py: Python<'_>,
+        members: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Vec<Vec<u8>>> {
+        check_read_options_cancellation(options)?;
+        let indices = members
+            .try_iter()?
+            .map(|member| self.resolve_index(&member?))
+            .collect::<PyResult<Vec<_>>>()?;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let data = py
+            .detach(|| {
+                self.archive.read_members_at_with_options(
+                    &indices,
+                    self.extraction_options(options, password.as_deref()),
+                )
+            })
+            .map_err(map_error)?;
+        data.into_iter()
+            .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
+            .collect()
+    }
+
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = false, *, options = None))]
+    fn extract(
+        &self,
+        py: Python<'_>,
+        member: &Bound<'_, PyAny>,
+        path: Option<PathBuf>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        overwrite: bool,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<PathBuf> {
+        check_read_options_cancellation(options)?;
+        let target = self.resolve_index(member)?;
+        let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let written = py
+            .detach(|| {
+                extract_archive(
+                    &self.archive,
+                    Some(&target),
+                    &out_dir,
+                    self.extraction_options(options, password.as_deref()),
+                    overwrite,
+                )
+            })
+            .map_err(map_error)?;
+        written
+            .into_iter()
+            .next()
+            .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
+    }
+
+    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = false, *, options = None))]
+    fn extractall(
+        &self,
+        py: Python<'_>,
+        path: Option<PathBuf>,
+        members: Option<&Bound<'_, PyAny>>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        overwrite: bool,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Vec<PathBuf>> {
+        check_read_options_cancellation(options)?;
+        let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
+        let selected = match members {
+            Some(members) => Some(
+                members
+                    .try_iter()?
+                    .map(|member| self.resolve_index(&member?))
+                    .collect::<PyResult<HashSet<usize>>>()?,
+            ),
+            None => None,
+        };
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| {
+            extract_archive(
+                &self.archive,
+                selected.as_ref(),
+                &out_dir,
+                self.extraction_options(options, password.as_deref()),
+                overwrite,
+            )
+        })
+        .map_err(map_error)
+    }
+
+    #[pyo3(signature = (pwd = None, *, options = None))]
+    fn testrar(
+        &self,
+        py: Python<'_>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<()> {
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| {
+            self.archive
+                .test_with_options(self.extraction_options(options, password.as_deref()))
+        })
+        .map_err(map_error)
+    }
+
+    #[getter]
+    fn comment(&self, py: Python<'_>) -> PyResult<Option<Vec<u8>>> {
+        self.read_comment(py, None, None)
+    }
+
+    /// Returns the complete archive comment, or None if absent, under per-call read policies.
+    #[pyo3(signature = (pwd = None, *, options = None))]
+    fn read_comment(
+        &self,
+        py: Python<'_>,
+        pwd: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| {
+            self.archive
+                .comment_with_options(self.extraction_options(options, password.as_deref()))
+        })
+        .map_err(map_error)
+    }
+
+    #[getter]
+    fn needs_password(&self) -> bool {
+        self.infos.iter().any(|info| info.is_encrypted)
+    }
+
+    /// Returns the decoded comment attached to a member, or None if absent.
+    #[pyo3(signature = (member, pwd = None))]
+    fn getcomment(
+        &self,
+        py: Python<'_>,
+        member: &Bound<'_, PyAny>,
+        pwd: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Option<Vec<u8>>> {
+        let index = self.resolve_index(member)?;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        py.detach(|| self.archive.member_comment_at(index, password.as_deref()))
+            .map_err(map_error)
+    }
+
+    /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
+    /// This reads archive metadata and never follows the link.
+    fn readlink(&self, member: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+        let index = self.resolve_index(member)?;
+        let member = self
+            .archive
+            .members()
+            .nth(index)
+            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        if member.is_legacy_unix_symlink() {
+            return Ok(self
+                .archive
+                .legacy_symlink_target_at(index, self.password.as_deref())
+                .map_err(map_error)?
+                .expect("legacy symlink predicate checked above"));
+        }
+        member
+            .supported_redirection()
+            .map(|link| link.target_name.clone())
+            .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
+    }
+
+    /// Stored file timestamps as exact integer Unix nanoseconds. Missing kinds are absent.
+    fn gettimes(&self, member: &Bound<'_, PyAny>) -> PyResult<HashMap<String, i128>> {
+        let index = self.resolve_index(member)?;
+        let member = self
+            .archive
+            .members()
+            .nth(index)
+            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
+        let mut times = member.file_times().map_err(map_error)?.unwrap_or_default();
+        if times.modified.is_none() {
+            times.modified = member
+                .meta
+                .modification_time()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|time| {
+                    u32::try_from(time.as_secs())
+                        .ok()
+                        .map(|seconds| rars_rs::FileTimestamp::Unix {
+                            seconds,
+                            nanoseconds: time.subsec_nanos(),
+                        })
+                });
+        }
+        Ok([
+            ("modified", times.modified),
+            ("created", times.created),
+            ("accessed", times.accessed),
+        ]
+        .into_iter()
+        .filter_map(|(name, time)| time.map(|time| (name.to_string(), time.unix_nanoseconds())))
+        .collect())
+    }
+
+    /// Metadata/settings the current rewrite implementation cannot preserve.
+    /// This is a conservative metadata check, not a payload integrity test.
+    fn rewrite_preservation_issues(&self) -> Vec<String> {
+        self.archive.rewrite_preservation_issues()
+    }
+
+    #[getter]
+    fn sfx_offset(&self) -> usize {
+        self.archive.sfx_offset()
+    }
+
+    #[getter]
+    fn family(&self) -> String {
+        family_name(self.archive.family()).to_string()
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyAny>>,
+        _exc: Option<&Bound<'_, PyAny>>,
+        _tb: Option<&Bound<'_, PyAny>>,
+    ) -> bool {
+        false
+    }
+
+    fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let list = PyList::new(py, self.infos.clone())?;
+        Ok(list.call_method0("__iter__")?.unbind())
+    }
+}
+
+impl RarFile {
+    fn resolve_index(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
+            if !info
+                .archive_identity
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.identity))
+            {
+                return Err(PyValueError::new_err(
+                    "RarInfo belongs to a different archive",
+                ));
+            }
+            return Ok(info.member_index);
+        }
+        if self.encoding.is_some() {
+            if let Ok(text) = member.extract::<String>() {
+                let names = self
+                    .names
+                    .get_or_init(|| MemberNames::new(&self.infos, true));
+                return match names.decoded.get(&text) {
+                    Some(Some(index)) => Ok(*index),
+                    Some(None) => Err(PyValueError::new_err(
+                        "ambiguous decoded name; select an entry by its RarInfo or original bytes",
+                    )),
+                    None => Err(PyKeyError::new_err(text)),
+                };
+            }
+        }
+        let name = member_name_bytes(member)?;
+        // Retain reverse lookup's constant-time last-entry case without
+        // building an index for callers reading only that one entry.
+        if self
+            .infos
+            .last()
+            .is_some_and(|info| info.orig_filename_bytes.as_ref() == name)
+        {
+            return Ok(self.infos.len() - 1);
+        }
+        let names = self
+            .names
+            .get_or_init(|| MemberNames::new(&self.infos, self.encoding.is_some()));
+        names
+            .raw
+            .get(name.as_slice())
+            .copied()
+            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&name).into_owned()))
+    }
+
+    fn extraction_options<'a>(
+        &self,
+        settings: Option<&'a ReadOptions>,
+        password: Option<&'a [u8]>,
+    ) -> rars_rs::ArchiveReadOptions<'a> {
+        let mut options = python_read_options(settings, password);
+        options.legacy_name_encoding = options.legacy_name_encoding.or(self.encoding);
+        options
+    }
+
+    fn from_bytes(
+        py: Python<'_>,
+        bytes: Vec<u8>,
+        password: Option<Vec<u8>>,
+        options: Option<&ReadOptions>,
+    ) -> PyResult<Self> {
+        let parse_password = password.clone();
+        let archive = py
+            .detach(|| {
+                let options = python_read_options(options, parse_password.as_deref());
+                rars_rs::ArchiveReader::read_owned_with_options(bytes, options)
+            })
+            .map_err(map_error)?;
+        let encoding = options.and_then(|settings| settings.encoding);
+        let identity = Arc::new(());
+        let infos = archive
+            .members()
+            .enumerate()
+            .map(|(index, member)| {
+                let filename =
+                    String::from_utf8_lossy(&member.decoded_name(encoding)?).into_owned();
+                let mut info = info_from_member_named(member, filename);
+                info.member_index = index;
+                info.archive_identity = Some(identity.clone());
+                Ok(info)
+            })
+            .collect::<rars_rs::Result<Vec<_>>>()
+            .map_err(map_error)?;
+        Ok(Self {
+            identity,
+            encoding,
+            archive,
+            password,
+            infos,
+            names: OnceLock::new(),
+        })
+    }
+}
+
+/// The Python face of [`rars_rs::Builder`]. Everything about choosing a writer,
+/// mapping members onto entry types and splitting volumes lives in the core
+/// crate; what is left here is argument conversion and the exception types
+/// Python callers catch.
+#[pyclass(module = "rars", skip_from_py_object)]
+#[derive(Debug, Clone)]
+struct RarBuilder {
+    inner: rars_rs::Builder,
+    format: rars_rs::ArchiveVersion,
+    rewrite: Option<RewriteInput>,
+    resources: rars_rs::WriterResources,
+}
+
+enum PythonVolumes {
+    Tracked(rars_rs::WriterVolumes),
+    Untracked(Vec<Vec<u8>>),
+}
+impl PythonVolumes {
+    fn len(&self) -> usize {
+        match self {
+            Self::Tracked(v) => v.volumes().len(),
+            Self::Untracked(v) => v.len(),
+        }
+    }
+    fn part(&self, index: usize) -> &[u8] {
+        match self {
+            Self::Tracked(v) => v.volumes()[index].as_bytes(),
+            Self::Untracked(v) => &v[index],
+        }
+    }
+}
+
+/// Original identity follows edits; verified payload sources belong to one write.
+#[derive(Debug, Clone)]
+struct RewriteInput {
+    archive: rars_rs::Archive,
+    password: Option<Vec<u8>>,
+    members: HashMap<usize, RewriteMember>,
+    directory: Option<PathBuf>,
+    max_staged_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RewriteMember {
+    index: usize,
+    size: u64,
+}
+
+impl RewriteInput {
+    fn prepare<T>(
+        &self,
+        builder: &mut rars_rs::Builder,
+        directory: &Path,
+        progress: Option<Arc<PythonProgress>>,
+        consume: impl FnOnce(&rars_rs::Builder) -> rars_rs::Result<T>,
+    ) -> rars_rs::Result<T> {
+        let mut members: Vec<_> = self.members.iter().collect();
+        members.sort_unstable_by_key(|(_, member)| member.index);
+        let limit = match self.max_staged_bytes {
+            Some(limit) => limit,
+            None => members.iter().try_fold(0u64, |sum, (_, member)| {
+                sum.checked_add(member.size)
+                    .ok_or(rars_rs::Error::RewriteStagingLimitExceeded {
+                        limit: u64::MAX,
+                        required: u64::MAX,
+                    })
+            })?,
+        };
+        let indices: Vec<_> = members.iter().map(|(_, member)| member.index).collect();
+        let mut options =
+            rars_rs::ArchiveReadOptions::with_optional_password(self.password.as_deref());
+        if let Some(progress) = &progress {
+            options = options.with_cancellation(&progress.read_cancellation);
+        }
+        self.archive.with_rewrite_sources(
+            &indices,
+            options,
+            &rars_rs::RewriteStaging {
+                directory: self.directory.as_deref().unwrap_or(directory).to_path_buf(),
+                max_staged_bytes: limit,
+            },
+            progress
+                .clone()
+                .map(|progress| progress as Arc<dyn rars_rs::WriteProgress>),
+            |sources| {
+                for ((id, _), source) in members.into_iter().zip(sources) {
+                    builder.set_source_by_id(*id, source)?;
+                }
+                consume(builder)
+            },
+        )
+    }
+}
+
+fn python_progress(
+    callback: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<Option<Arc<PythonProgress>>> {
+    let callback = callback
+        .map(|callback| {
+            if !callback.is_callable() {
+                return Err(PyValueError::new_err("progress must be callable"));
+            }
+            Ok(callback.clone().unbind())
+        })
+        .transpose()?;
+    if callback.is_none() && cancellation.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(PythonProgress::new(callback, cancellation))))
+}
+
+/// Preserve the established Python argument exceptions for builder refusals.
+#[derive(Debug, PartialEq, Eq)]
+enum BuilderRefusal {
+    NoSuchEntry,
+    DuplicateName,
+    Symlink,
+    Other,
+}
+
+fn classify_builder_error(error: &rars_rs::Error) -> BuilderRefusal {
+    match error.root_cause() {
+        rars_rs::Error::EntryNotFound => BuilderRefusal::NoSuchEntry,
+        rars_rs::Error::DuplicateEntry => BuilderRefusal::DuplicateName,
+        rars_rs::Error::InputSymlink => BuilderRefusal::Symlink,
+        _ => BuilderRefusal::Other,
+    }
+}
+
+fn map_builder_error(error: rars_rs::Error) -> PyErr {
+    match (classify_builder_error(&error), error.entry_context()) {
+        (BuilderRefusal::NoSuchEntry, Some((name, _))) => {
+            PyKeyError::new_err(String::from_utf8_lossy(name).into_owned())
+        }
+        (BuilderRefusal::DuplicateName, Some((name, _))) => PyValueError::new_err(format!(
+            "duplicate archive entry name: {}",
+            String::from_utf8_lossy(name)
+        )),
+        (BuilderRefusal::Symlink, Some((name, _))) => PyValueError::new_err(format!(
+            "input '{}' is a symlink; refusing to follow it",
+            String::from_utf8_lossy(name)
+        )),
+        _ => map_error(error),
+    }
+}
+
+#[pymethods]
+impl RarBuilder {
+    #[new]
+    #[pyo3(signature = (
+        format = "rar50",
+        compression = 3,
+        store = false,
+        solid = false,
+        password = None,
+        encrypt_headers = false,
+        comment = None,
+        recovery_percent = None,
+        volume_size = None,
+        filters = None,
+        max_memory_bytes = None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        format: &str,
+        compression: u8,
+        store: bool,
+        solid: bool,
+        password: Option<&Bound<'_, PyAny>>,
+        encrypt_headers: bool,
+        comment: Option<&Bound<'_, PyAny>>,
+        recovery_percent: Option<u64>,
+        volume_size: Option<usize>,
+        filters: Option<&Bound<'_, PyAny>>,
+        max_memory_bytes: Option<u64>,
+    ) -> PyResult<Self> {
+        if filters.is_some() {
+            return Err(PyNotImplementedError::new_err(
+                "filter selection is not exposed yet; use the default writer filter policy",
+            ));
+        }
+        let format = parse_version(format)?;
+        Ok(Self {
+            inner: rars_rs::Builder::new(format)
+                .compression_level(Some(compression))
+                .store(store)
+                .solid(solid)
+                .password(py_password(password)?)
+                .header_encryption(encrypt_headers)
+                .comment(py_optional_bytes(comment)?)
+                .recovery_percent(recovery_percent)
+                .volume_size(volume_size),
+            format,
+            rewrite: None,
+            resources: max_memory_bytes.map_or_else(rars_rs::WriterResources::default, |limit| {
+                rars_rs::WriterResources::default().with_max_memory_bytes(limit)
+            }),
+        })
+    }
+
+    /// Create a rewrite builder. Supported RAR1.3–4.x files retain
+    /// native names, supported DOS timestamps, attributes, solid mode and
+    /// supported data/header encryption.
+    /// For RAR5/7, format,
+    /// solid, data/header/comment encryption and archive metadata settings are
+    /// retained; unknown or unsupported preservation fails before output.
+    /// Explicit preserve=False converts to RAR5 level 3, non-solid and unencrypted.
+    /// File contents, raw names, order, comments, directories, supported links
+    /// and modification/creation/access times are copied in both modes.
+    /// For an existing RarFile, its configured password is used. Preservation
+    /// reuses it for encrypted output; conversion removes encryption.
+    /// Input files must remain available and unchanged until writing completes.
+    #[staticmethod]
+    /// Payload staging happens afresh during each write. staging_dir defaults
+    /// to the output directory (current directory for to_bytes); max_staged_bytes
+    /// defaults to the retained payloads' combined declared uncompressed size.
+    #[pyo3(signature = (source, password = None, *, preserve = true, staging_dir = None, max_staged_bytes = None))]
+    fn from_archive(
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        password: Option<&Bound<'_, PyAny>>,
+        preserve: bool,
+        staging_dir: Option<&Bound<'_, PyAny>>,
+        max_staged_bytes: Option<u64>,
+    ) -> PyResult<Self> {
+        let archive = match source.extract::<PyRef<'_, RarFile>>() {
+            Ok(archive) => RarFile {
+                identity: archive.identity.clone(),
+                encoding: None,
+                archive: archive.archive.clone(),
+                password: archive.password.clone(),
+                infos: archive.infos.clone(),
+                names: OnceLock::new(),
+            },
+            Err(_) => RarFile::new(py, source, "r", password, None)?,
+        };
+        let password = archive.password.clone();
+        if preserve {
+            let issues = archive.archive.rewrite_preservation_issues();
+            if !issues.is_empty() {
+                return Err(UnsupportedRarFeature::new_err(format!(
+                    "cannot preserve archive: {}; use preserve=False for explicit RAR5 conversion (archive settings may be lost)",
+                    issues.join("; ")
+                )));
+            }
+        }
+        let comments = archive
+            .archive
+            .member_comments(password.as_deref())
+            .map_err(map_error)?;
+        let inner = if preserve {
+            archive
+                .archive
+                .preserving_builder(password.as_deref())
+                .map_err(map_error)?
+        } else {
+            rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50).compression_level(Some(3))
+        };
+        let format = inner.format();
+        let legacy_preservation = preserve && format.family() != rars_rs::ArchiveFamily::Rar50Plus;
+        let mut builder = Self {
+            inner: inner
+                .comment(archive.comment(py)?)
+                .allow_duplicate_names(true),
+            format,
+            resources: rars_rs::WriterResources::default(),
+            rewrite: Some(RewriteInput {
+                archive: archive.archive.clone(),
+                password: password.clone(),
+                members: HashMap::new(),
+                directory: staging_dir.map(|path| py_path_buf(py, path)).transpose()?,
+                max_staged_bytes,
+            }),
+        };
+        let comment_encryption = archive.archive.member_comment_encryption();
+        let legacy_links = archive
+            .archive
+            .legacy_symlink_targets(password.as_deref())
+            .map_err(map_error)?;
+        for (((member_index, member), comment), legacy_link) in archive
+            .archive
+            .members()
+            .enumerate()
+            .zip(comments)
+            .zip(legacy_links)
+        {
+            let legacy_unicode_name = if legacy_preservation {
+                match &member.detail {
+                    rars_rs::ArchiveMemberDetail::Rar15To40 { unicode_name, .. } => {
+                        unicode_name.clone()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let legacy_extended_times = if legacy_preservation {
+                match &member.detail {
+                    rars_rs::ArchiveMemberDetail::Rar15To40 { extended_times, .. }
+                        if !extended_times.is_empty() =>
+                    {
+                        Some(extended_times.clone())
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let file_times = if legacy_preservation {
+                None
+            } else {
+                member.file_times().map_err(map_error)?
+            };
+            let link = member.supported_redirection().cloned();
+            let retained_link = link.as_ref().map(|_| member.clone());
+            let info = member.meta;
+            // A builder mode is Unix metadata, not generic archive attributes.
+            // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
+            // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
+            let attr_source = info.attr_source();
+            let output_name = if !legacy_preservation
+                && info.family != rars_rs::ArchiveFamily::Rar50Plus
+                && attr_source == rars_rs::AttrSource::Unix
+            {
+                rars_rs::builder::validate_entry_name(info.name.clone())
+                    .map_err(map_builder_error)?;
+                rars_rs::filename::encode_rar50(&info.name).into_owned()
+            } else {
+                info.name.clone()
+            };
+            let unix_type = info.file_attr & 0o170000;
+            let unsupported_type = attr_source == rars_rs::AttrSource::Unix
+                && !matches!(unix_type, 0 | 0o100000)
+                && !(info.is_directory && unix_type == 0o040000);
+            let reparse_point =
+                attr_source == rars_rs::AttrSource::Dos && info.file_attr & 0x400 != 0;
+            if link.is_none()
+                && legacy_link.is_none()
+                && (info.is_redirection
+                    || unsupported_type
+                    || reparse_point
+                    || (info.is_directory && info.unpacked_size != 0))
+            {
+                return Err(UnsupportedRarFeature::new_err(format!(
+                    "cannot rewrite special entry {:?}: its type or contents cannot be preserved",
+                    String::from_utf8_lossy(&info.name)
+                )));
+            }
+            let mode =
+                (attr_source == rars_rs::AttrSource::Unix).then_some(if legacy_preservation {
+                    info.file_attr as u32
+                } else {
+                    (info.file_attr & 0o7777) as u32
+                });
+            // Reuse CLI extraction's local-zone policy for legacy DOS times,
+            // including the extended odd second, before writing RAR5 Unix time.
+            let modified = (!legacy_preservation)
+                .then(|| info.modification_time())
+                .flatten()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+            let mtime = if legacy_preservation {
+                info.file_time
+            } else {
+                modified
+                    .map(|duration| u32::try_from(duration.as_secs()))
+                    .transpose()
+                    .map_err(|_| {
+                        PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
+                    })?
+            };
+            if let Some(member) = retained_link {
+                builder
+                    .inner
+                    .add_archive_redirection(&member)
+                    .map_err(map_builder_error)?;
+            } else if let Some(target) = legacy_link {
+                builder
+                    .inner
+                    .add_unix_symlink(
+                        output_name.clone(),
+                        if legacy_preservation {
+                            target
+                        } else {
+                            rars_rs::filename::encode_rar50(&target).into_owned()
+                        },
+                        false,
+                        mtime,
+                        mode,
+                    )
+                    .map_err(map_builder_error)?;
+            } else if info.is_directory {
+                builder
+                    .inner
+                    .add_directory(output_name.clone(), mtime, mode)
+                    .map_err(map_builder_error)?;
+            } else {
+                // The per-write builder replaces this placeholder after a single
+                // verified traversal. Never decode individual members on reopen.
+                let source = rars_rs::EntrySource::from_opener(info.unpacked_size, || {
+                    Err(rars_rs::Error::InvalidArgument(
+                        "rewrite payload was not staged",
+                    ))
+                });
+                builder
+                    .inner
+                    .add_source(output_name.clone(), source, mtime, mode)
+                    .map_err(map_builder_error)?;
+                builder.rewrite.as_mut().unwrap().members.insert(
+                    builder.inner.member_ids().last().unwrap(),
+                    RewriteMember {
+                        index: member_index,
+                        size: info.unpacked_size,
+                    },
+                );
+            }
+            let id = builder.inner.member_ids().last().unwrap();
+            builder
+                .inner
+                .set_file_comment_by_id(id, comment)
+                .map_err(map_builder_error)?;
+            if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
+                builder
+                    .inner
+                    .set_mtime_nanoseconds_by_id(id, time.subsec_nanos())
+                    .map_err(map_builder_error)?;
+            }
+            if preserve {
+                builder
+                    .inner
+                    .set_entry_encryption_by_id(
+                        id,
+                        if info.is_encrypted {
+                            password.clone()
+                        } else {
+                            None
+                        },
+                        if comment_encryption[member_index] {
+                            password.clone()
+                        } else {
+                            None
+                        },
+                    )
+                    .map_err(map_builder_error)?;
+            }
+            if let Some(raw) = legacy_unicode_name {
+                builder
+                    .inner
+                    .set_legacy_unicode_name_by_id(id, raw)
+                    .map_err(map_builder_error)?;
+            }
+            if legacy_extended_times.is_some() {
+                builder
+                    .inner
+                    .set_legacy_extended_times_by_id(id, legacy_extended_times)
+                    .map_err(map_builder_error)?;
+            }
+            if file_times.is_some() {
+                builder
+                    .inner
+                    .set_file_times_by_id(id, file_times)
+                    .map_err(map_builder_error)?;
+            }
+            if attr_source == rars_rs::AttrSource::Dos {
+                builder
+                    .inner
+                    .set_dos_attributes_by_id(id, info.file_attr)
+                    .map_err(map_builder_error)?;
+            }
+        }
+        builder.inner = builder.inner.allow_duplicate_names(false);
+        Ok(builder)
+    }
+
+    #[pyo3(signature = (path, arcname = None))]
+    fn add(
+        &mut self,
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        arcname: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let path = py_path_buf(py, path)?;
+        let base = match arcname {
+            Some(name) => member_name_bytes(name)?,
+            None => archive_base_name(&path)?,
+        };
+        self.inner.add_path(&path, &base).map_err(map_builder_error)
+    }
+
+    /// Add an explicit, possibly empty directory to RAR5/7 output.
+    #[pyo3(signature = (arcname, mtime = None, mode = None))]
+    fn add_directory(
+        &mut self,
+        arcname: &Bound<'_, PyAny>,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> PyResult<()> {
+        self.inner
+            .add_directory(member_name_bytes(arcname)?, mtime, mode)
+            .map_err(map_builder_error)
+    }
+
+    #[pyo3(signature = (data, arcname, mtime = None, mode = None))]
+    fn add_bytes(
+        &mut self,
+        data: Vec<u8>,
+        arcname: &Bound<'_, PyAny>,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> PyResult<()> {
+        self.inner
+            .add_bytes(member_name_bytes(arcname)?, data, mtime, mode)
+            .map_err(map_builder_error)
+    }
+
+    /// Stable IDs in output order. Integer edit arguments select these IDs.
+    fn member_ids(&self) -> Vec<usize> {
+        self.inner.member_ids().collect()
+    }
+
+    fn remove(&mut self, name: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = self.edit_member_id(name)?;
+        self.inner.remove_by_id(id).map_err(map_builder_error)?;
+        if let Some(rewrite) = &mut self.rewrite {
+            rewrite.members.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = self.edit_member_id(old)?;
+        self.inner
+            .rename_by_id(id, member_name_bytes(new)?)
+            .map_err(map_builder_error)
+    }
+
+    /// Queues a Unix symbolic link without reading or following the target.
+    /// Target bytes use the RAR5 wire encoding and remain unchanged by renames.
+    #[pyo3(signature = (arcname, target, *, target_is_directory=false, mtime=None, mode=None))]
+    fn add_unix_symlink(
+        &mut self,
+        arcname: &Bound<'_, PyAny>,
+        target: &Bound<'_, PyAny>,
+        target_is_directory: bool,
+        mtime: Option<u32>,
+        mode: Option<u32>,
+    ) -> PyResult<()> {
+        self.inner
+            .add_unix_symlink(
+                member_name_bytes(arcname)?,
+                member_name_bytes(target)?,
+                target_is_directory,
+                mtime,
+                mode,
+            )
+            .map_err(map_builder_error)
+    }
+
+    /// Sets complete timestamps from exact Unix nanoseconds.
+    #[pyo3(signature = (member, *, modified_ns=None, created_ns=None, accessed_ns=None))]
+    fn set_times(
+        &mut self,
+        member: &Bound<'_, PyAny>,
+        modified_ns: Option<i128>,
+        created_ns: Option<i128>,
+        accessed_ns: Option<i128>,
+    ) -> PyResult<()> {
+        let times = rars_rs::FileTimes::from_unix_nanoseconds(modified_ns, created_ns, accessed_ns)
+            .map_err(map_builder_error)?;
+        let id = self.edit_member_id(member)?;
+        self.inner
+            .set_file_times_by_id(
+                id,
+                (times != rars_rs::FileTimes::default()).then_some(times),
+            )
+            .map_err(map_builder_error)
+    }
+
+    /// Sets or removes the comment attached to a queued member.
+    #[pyo3(signature = (member, comment = None))]
+    fn set_file_comment(
+        &mut self,
+        member: &Bound<'_, PyAny>,
+        comment: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let id = self.edit_member_id(member)?;
+        self.inner
+            .set_file_comment_by_id(id, py_optional_bytes(comment)?)
+            .map_err(map_builder_error)
+    }
+
+    #[pyo3(signature = (*, progress = None, cancellation = None))]
+    fn to_bytes(
+        &self,
+        py: Python<'_>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Py<PyBytes>> {
+        if self.resources.max_memory_bytes().is_none() {
+            let bytes = self.detached(
+                py,
+                progress,
+                cancellation,
+                Path::new("."),
+                |builder, progress| builder.to_bytes_with_progress(progress),
+            )?;
+            return Ok(PyBytes::new(py, &bytes).unbind());
+        }
+        let output = self.detached(
+            py,
+            progress,
+            cancellation,
+            Path::new("."),
+            |builder, progress| builder.to_output(&self.resources, progress),
+        )?;
+        output
+            .copy_with(|bytes| PyBytes::new(py, bytes).unbind())
+            .map_err(map_error)
+    }
+
+    #[pyo3(signature = (path, *, progress = None, cancellation = None))]
+    fn write(
+        &self,
+        py: Python<'_>,
+        path: &Bound<'_, PyAny>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<()> {
+        let path = py_path_buf(py, path)?;
+        let directory = output_directory(&path);
+        self.detached(
+            py,
+            progress,
+            cancellation,
+            directory,
+            |builder, progress| {
+                builder.write_to_path_with_resources(
+                    &path,
+                    &self.resources.clone().with_temp_dir(directory),
+                    progress,
+                )
+            },
+        )
+    }
+
+    #[pyo3(signature = (first_path, *, progress = None, cancellation = None))]
+    fn write_volumes(
+        &self,
+        py: Python<'_>,
+        first_path: &Bound<'_, PyAny>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Vec<PathBuf>> {
+        let first_path = py_path_buf(py, first_path)?;
+        let parts = self.detached(
+            py,
+            progress,
+            cancellation,
+            output_directory(&first_path),
+            |builder, progress| {
+                if self.resources.max_memory_bytes().is_some() {
+                    builder
+                        .to_volume_output(
+                            &self
+                                .resources
+                                .clone()
+                                .with_temp_dir(output_directory(&first_path)),
+                            progress,
+                        )
+                        .map(PythonVolumes::Tracked)
+                } else {
+                    builder
+                        .build_volumes(progress)
+                        .map(PythonVolumes::Untracked)
+                }
+            },
+        )?;
+        py.detach(|| {
+            // A naming refusal must precede any replacement of existing parts.
+            let paths = (0..parts.len())
+                .map(|index| {
+                    if matches!(
+                        self.format,
+                        rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
+                    ) {
+                        rar50_volume_part_path(&first_path, index, parts.len())
+                    } else {
+                        legacy_volume_part_path(&first_path, index)
+                    }
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            for (index, path) in paths.iter().enumerate() {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    return Err(map_error(rars_rs::Error::Cancelled));
+                }
+                fs::write(path, parts.part(index)).map_err(map_io_error)?;
+            }
+            Ok(paths)
+        })
+    }
+}
+
+impl RarBuilder {
+    fn edit_member_id(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
+        if member.is_instance_of::<pyo3::types::PyInt>() {
+            let id: usize = member
+                .extract()
+                .map_err(|_| PyKeyError::new_err("invalid member ID"))?;
+            if !self.inner.member_ids().any(|candidate| candidate == id) {
+                return Err(PyKeyError::new_err(id));
+            }
+            Ok(id)
+        } else {
+            self.inner
+                .entry_id(&member_name_bytes(member)?)
+                .map_err(map_builder_error)
+        }
+    }
+
+    /// Run a core-builder call with the GIL released, wiring a Python callback
+    /// to it as a progress sink. A callback that raises cancels the write, and
+    /// its exception is re-raised here rather than the cancellation the core
+    /// crate reports.
+    fn detached<T, F>(
+        &self,
+        py: Python<'_>,
+        callback: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+        directory: &Path,
+        run: F,
+    ) -> PyResult<T>
+    where
+        T: Send,
+        F: FnOnce(&rars_rs::Builder, Option<&dyn rars_rs::WriteProgress>) -> rars_rs::Result<T>
+            + Send,
+    {
+        let progress = python_progress(callback, cancellation)?;
+        let rewrite = self.rewrite.clone();
+        let worker = progress.clone();
+        let result = py.detach(move || {
+            let consume = |builder: &rars_rs::Builder| {
+                run(
+                    builder,
+                    worker
+                        .as_deref()
+                        .map(|progress| progress as &dyn rars_rs::WriteProgress),
+                )
+            };
+            if let Some(rewrite) = rewrite {
+                let mut builder = self.inner.clone();
+                rewrite.prepare(&mut builder, directory, worker.clone(), consume)
+            } else {
+                consume(&self.inner)
+            }
+        });
+        if let Some(error) = progress.as_ref().and_then(|progress| progress.take_error()) {
+            return Err(error);
+        }
+        result.map_err(map_error)
+    }
+}
+
+fn output_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn check_python_cancellation(cancellation: Option<&CancellationToken>) -> PyResult<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(PyInterruptedError::new_err("operation cancelled"));
+    }
+    Ok(())
+}
+
+fn py_input_bytes_with_cancellation(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<Vec<u8>> {
+    check_python_cancellation(cancellation)?;
+    if let Ok(bytes) = source.extract::<Vec<u8>>() {
+        check_python_cancellation(cancellation)?;
+        return Ok(bytes);
+    }
+    let path = py_path_buf(py, source)?;
+    py.detach(|| {
+        use std::io::Read;
+        check_python_cancellation(cancellation)?;
+        let mut file = fs::File::open(path).map_err(map_io_error)?;
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            check_python_cancellation(cancellation)?;
+            let count = match file.read(&mut buffer) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result.map_err(map_io_error)?,
+            };
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        check_python_cancellation(cancellation)?;
+        Ok(bytes)
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (source, password = None, *, cancellation = None))]
+fn repair(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    password: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<Vec<u8>> {
+    check_python_cancellation(cancellation)?;
+    let password = py_password(password)?;
+    let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
+    py.detach(|| repair_core(&bytes, password.as_deref(), cancellation).map(|result| result.data))
+        .map_err(map_error)
+}
+
+/// A parsing cancellation must not start the damaged-header fallback.
+fn repair_core(
+    bytes: &[u8],
+    password: Option<&[u8]>,
+    cancellation: Option<&CancellationToken>,
+) -> rars_rs::Result<rars_rs::RecoveryRepairResult> {
+    let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
+    options.cancellation = cancellation.map(|token| &token.inner);
+    match rars_rs::ArchiveReader::read_with_options(bytes, options) {
+        Ok(archive) => archive.repair_recovery_with_options(options),
+        Err(error) if error.kind() == rars_rs::ErrorKind::Cancelled => Err(error),
+        Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(bytes, options),
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (source, password = None, *, cancellation = None))]
+fn repair_detailed(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    password: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<RepairResult> {
+    check_python_cancellation(cancellation)?;
+    let password = py_password(password)?;
+    let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
+    py.detach(|| {
+        let result = repair_core(&bytes, password.as_deref(), cancellation)?;
+        Ok(RepairResult {
+            data: result.data,
+            report: result.report.into(),
+        })
+    })
+    .map_err(map_error)
+}
+
+#[pyfunction]
+#[pyo3(signature = (input, output, password = None, *, cancellation = None))]
+fn repair_to_path(
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    output: &Bound<'_, PyAny>,
+    password: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<()> {
+    check_python_cancellation(cancellation)?;
+    let output = py_path_buf(py, output)?;
+    let password = py_password(password)?;
+    let bytes = py_input_bytes_with_cancellation(py, input, cancellation)?;
+    py.detach(|| {
+        let result = repair_core(&bytes, password.as_deref(), cancellation)?;
+        result.write_to_path(&output, cancellation.map(|token| &token.inner))
+    })
+    .map_err(map_error)
+}
+
+#[pyfunction]
+#[pyo3(signature = (paths, path = None, password = None, overwrite = false, *, options = None))]
+fn extract_volumes(
+    py: Python<'_>,
+    paths: &Bound<'_, PyAny>,
+    path: Option<PathBuf>,
+    password: Option<&Bound<'_, PyAny>>,
+    overwrite: bool,
+    options: Option<&ReadOptions>,
+) -> PyResult<Vec<PathBuf>> {
+    let archive_paths = py_paths(paths)?;
+    let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
+    let password = py_password(password)?;
+    py.detach(|| {
+        let options = python_read_options(options, password.as_deref());
+        let archives = read_archives_from_paths(&archive_paths, options)?;
+        extract_volumes_archive(&archives, &out_dir, options, overwrite)
+    })
+    .map_err(map_error)
+}
+
+#[pyfunction]
+#[pyo3(signature = (paths, password = None, *, options = None))]
+fn test_volumes(
+    py: Python<'_>,
+    paths: &Bound<'_, PyAny>,
+    password: Option<&Bound<'_, PyAny>>,
+    options: Option<&ReadOptions>,
+) -> PyResult<()> {
+    let archive_paths = py_paths(paths)?;
+    let password = py_password(password)?;
+    py.detach(|| {
+        let options = python_read_options(options, password.as_deref());
+        let archives = read_archives_from_paths(&archive_paths, options)?;
+        rars_rs::extract_volumes_to_with_options(&archives, options, |_| {
+            Ok(Box::new(io::sink()) as Box<dyn Write>)
+        })
+    })
+    .map_err(map_error)
+}
+
+#[pymodule]
+fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<RarFile>()?;
+    m.add_class::<RarInfo>()?;
+    m.add_class::<RarBuilder>()?;
+    m.add_class::<ProgressEvent>()?;
+    m.add_class::<CancellationToken>()?;
+    m.add_class::<ReadOptions>()?;
+    m.add_class::<RepairReport>()?;
+    m.add_class::<RepairResult>()?;
+    m.add_function(wrap_pyfunction!(repair, m)?)?;
+    m.add_function(wrap_pyfunction!(repair_detailed, m)?)?;
+    m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_volumes, m)?)?;
+    m.add_function(wrap_pyfunction!(test_volumes, m)?)?;
+    m.add("Error", py.get_type::<Error>())?;
+    m.add("BadRarFile", py.get_type::<BadRarFile>())?;
+    m.add("BadPassword", py.get_type::<BadPassword>())?;
+    m.add("PasswordRequired", py.get_type::<PasswordRequired>())?;
+    m.add(
+        "UnsupportedRarFeature",
+        py.get_type::<UnsupportedRarFeature>(),
+    )?;
+    m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
+    for version in [
+        "rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
+    ] {
+        m.add(version.to_ascii_uppercase(), version)?;
+    }
+    Ok(())
+}
+
+fn py_path_buf(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
+    let os = py.import("os")?;
+    let path = os.call_method1("fspath", (value,))?;
+    path.extract::<PathBuf>()
+}
+
+fn py_paths(value: &Bound<'_, PyAny>) -> PyResult<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for item in value.try_iter()? {
+        out.push(item?.extract::<PathBuf>()?);
+    }
+    if out.is_empty() {
+        return Err(PyValueError::new_err("volume path list is empty"));
+    }
+    Ok(out)
+}
+
+fn py_password(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            if let Ok(bytes) = value.extract::<Vec<u8>>() {
+                Ok(Some(bytes))
+            } else {
+                Ok(Some(value.extract::<String>()?.into_bytes()))
+            }
+        }
+    }
+}
+
+fn py_optional_bytes(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            if let Ok(bytes) = value.extract::<Vec<u8>>() {
+                Ok(Some(bytes))
+            } else {
+                Ok(Some(value.extract::<String>()?.into_bytes()))
+            }
+        }
+    }
+}
+
+fn member_name_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(info) = value.extract::<PyRef<'_, RarInfo>>() {
+        return Ok(info.orig_filename_bytes.to_vec());
+    }
+    if let Ok(bytes) = value.extract::<Vec<u8>>() {
+        return Ok(bytes);
+    }
+    Ok(value.extract::<String>()?.into_bytes())
+}
+
+fn check_read_options_cancellation(options: Option<&ReadOptions>) -> PyResult<()> {
+    if options
+        .and_then(|options| options.cancellation.as_ref())
+        .is_some_and(rars_rs::ReadCancellation::is_cancelled)
+    {
+        return Err(map_error(rars_rs::Error::Cancelled));
+    }
+    Ok(())
+}
+
+trait Selection {
+    fn contains_member(&self, index: usize, name: &[u8]) -> bool;
+}
+
+impl Selection for Vec<u8> {
+    fn contains_member(&self, _index: usize, name: &[u8]) -> bool {
+        self.as_slice() == name
+    }
+}
+
+impl Selection for HashSet<Vec<u8>> {
+    fn contains_member(&self, _index: usize, name: &[u8]) -> bool {
+        self.contains(name)
+    }
+}
+
+impl Selection for usize {
+    fn contains_member(&self, index: usize, _name: &[u8]) -> bool {
+        *self == index
+    }
+}
+
+impl Selection for HashSet<usize> {
+    fn contains_member(&self, index: usize, _name: &[u8]) -> bool {
+        self.contains(&index)
+    }
+}
+
+// Controlled extraction chooses a sink before core admission. Defer opening a
+// selected file so a declared-size refusal cannot truncate an existing target.
+struct DeferredExtractedFile {
+    path: PathBuf,
+    overwrite: bool,
+    file: Option<fs::File>,
+    written: Arc<Mutex<Vec<PathBuf>>>,
+}
+impl DeferredExtractedFile {
+    fn open(&mut self) -> io::Result<&mut fs::File> {
+        if self.file.is_none() {
+            fs::create_dir_all(
+                self.path
+                    .parent()
+                    .expect("checked output path has a file name"),
+            )?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            if self.overwrite {
+                options.create(true).truncate(true);
+            } else {
+                options.create_new(true);
+            }
+            set_no_follow(&mut options);
+            self.file = Some(options.open(&self.path)?);
+            self.written.lock().unwrap().push(self.path.clone());
+        }
+        Ok(self.file.as_mut().expect("opened above"))
+    }
+}
+struct DeferredExtractedSink(std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>);
+impl Write for DeferredExtractedSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().open()?.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.borrow_mut().open()?.flush()
+    }
+}
+
+fn extract_archive<S: Selection>(
+    archive: &rars_rs::Archive,
+    selected: Option<&S>,
+    out_dir: &Path,
+    options: rars_rs::ArchiveReadOptions<'_>,
+    overwrite: bool,
+) -> rars_rs::Result<Vec<PathBuf>> {
+    if options
+        .cancellation
+        .is_some_and(rars_rs::ReadCancellation::is_cancelled)
+    {
+        return Err(rars_rs::Error::Cancelled);
+    }
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let open = {
+        let written = Arc::clone(&written);
+        move |meta: &rars_rs::ExtractedEntryMeta| {
+            let path = checked_output_path(
+                out_dir,
+                meta,
+                archive.family(),
+                options.legacy_name_encoding,
+            )?;
+            if options.legacy_name_encoding.is_some()
+                && written
+                    .lock()
+                    .expect("written lock poisoned")
+                    .contains(&path)
+            {
+                return Err(rars_rs::Error::InvalidArgument(
+                    "multiple entries map to the same decoded output path",
+                ));
+            }
+            if meta.is_directory {
+                fs::create_dir_all(&path)?;
+                written.lock().expect("written lock poisoned").push(path);
+                return Ok(Box::new(io::sink()) as Box<dyn Write>);
+            }
+            fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            if overwrite {
+                options.create(true).truncate(true);
+            } else {
+                options.create_new(true);
+            }
+            set_no_follow(&mut options);
+            let file = options.open(&path)?;
+            written.lock().expect("written lock poisoned").push(path);
+            Ok(Box::new(file) as Box<dyn Write>)
+        }
+    };
+    if let Some(selected) = selected {
+        let last = archive
+            .member_refs()
+            .enumerate()
+            .filter(|(index, member)| {
+                !member.is_redirection() && selected.contains_member(*index, member.name_bytes())
+            })
+            .map(|(index, _)| index)
+            .last();
+        if let Some(last) = last {
+            let solid = archive.is_solid();
+            let mut index = 0;
+            let mut pending: Option<std::rc::Rc<std::cell::RefCell<DeferredExtractedFile>>> = None;
+            archive.extract_with_control(options, |member| {
+                // The previous payload has passed decoding and integrity checks.
+                // Materialize a successful empty file even if no writes occurred.
+                if let Some(file) = pending.take() {
+                    file.borrow_mut().open()?;
+                }
+                let current = index;
+                index += 1;
+                if current > last {
+                    return Ok(rars_rs::ExtractionDecision::Stop);
+                }
+                let meta = &member.meta;
+                if meta.is_redirection {
+                    return Ok(rars_rs::ExtractionDecision::Skip);
+                }
+                if !selected.contains_member(current, &meta.name) {
+                    return Ok(if solid && !meta.is_directory {
+                        rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
+                    } else {
+                        rars_rs::ExtractionDecision::Skip
+                    });
+                }
+                let unicode = member.name_is_unicode();
+                let mut meta = rars_rs::ExtractedEntryMeta::new(
+                    meta.name.clone(),
+                    meta.file_time,
+                    meta.file_attr,
+                    meta.is_directory,
+                )
+                .with_attr_source(meta.attr_source())
+                .with_mtime_refinement(meta.mtime_refinement);
+                meta.name_is_unicode = unicode;
+                if meta.is_directory {
+                    return Ok(rars_rs::ExtractionDecision::Extract(open(&meta)?));
+                }
+                let path = checked_output_path(
+                    out_dir,
+                    &meta,
+                    archive.family(),
+                    options.legacy_name_encoding,
+                )?;
+                if options.legacy_name_encoding.is_some()
+                    && written
+                        .lock()
+                        .expect("written lock poisoned")
+                        .contains(&path)
+                {
+                    return Err(rars_rs::Error::InvalidArgument(
+                        "multiple entries map to the same decoded output path",
+                    ));
+                }
+                let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
+                    path,
+                    overwrite,
+                    file: None,
+                    written: written.clone(),
+                }));
+                pending = Some(file.clone());
+                Ok(rars_rs::ExtractionDecision::Extract(Box::new(
+                    DeferredExtractedSink(file),
+                )))
+            })?;
+            if let Some(file) = pending.take() {
+                file.borrow_mut().open()?;
+            }
+        }
+    } else {
+        archive.extract_to_parallel_buffered_with_options(options, open)?;
+    }
+    let out = written.lock().expect("written lock poisoned").clone();
+    Ok(out)
+}
+
+fn extract_volumes_archive(
+    archives: &[rars_rs::Archive],
+    out_dir: &Path,
+    options: rars_rs::ArchiveReadOptions<'_>,
+    overwrite: bool,
+) -> rars_rs::Result<Vec<PathBuf>> {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    rars_rs::extract_volumes_to_with_options(archives, options, {
+        let written = Arc::clone(&written);
+        move |meta| {
+            let path = checked_output_path(
+                out_dir,
+                meta,
+                archives[0].family(),
+                options.legacy_name_encoding,
+            )?;
+            if options.legacy_name_encoding.is_some()
+                && written
+                    .lock()
+                    .expect("written lock poisoned")
+                    .contains(&path)
+            {
+                return Err(rars_rs::Error::InvalidArgument(
+                    "multiple entries map to the same decoded output path",
+                ));
+            }
+            if meta.is_directory {
+                fs::create_dir_all(&path)?;
+                written.lock().expect("written lock poisoned").push(path);
+                return Ok(Box::new(io::sink()) as Box<dyn Write>);
+            }
+            fs::create_dir_all(path.parent().expect("checked output path has a file name"))?;
+            let mut options = fs::OpenOptions::new();
+            options.write(true);
+            if overwrite {
+                options.create(true).truncate(true);
+            } else {
+                options.create_new(true);
+            }
+            set_no_follow(&mut options);
+            let file = options.open(&path)?;
+            written.lock().expect("written lock poisoned").push(path);
+            Ok(Box::new(file) as Box<dyn Write>)
+        }
+    })?;
+    let out = written.lock().expect("written lock poisoned").clone();
+    Ok(out)
+}
+
+fn read_archives_from_paths(
+    paths: &[PathBuf],
+    options: rars_rs::ArchiveReadOptions<'_>,
+) -> rars_rs::Result<Vec<rars_rs::Archive>> {
+    paths
+        .iter()
+        .map(|path| rars_rs::ArchiveReader::read_path_with_options(path, options))
+        .collect()
+}
+
+#[cfg(test)]
+fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
+    let filename = String::from_utf8_lossy(&member.meta.name).into_owned();
+    info_from_member_named(member, filename)
+}
+
+fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> RarInfo {
+    let mut detail = HashMap::new();
+    let mut crc = None;
+    let solid = member.is_solid();
+    match member.detail {
+        rars_rs::ArchiveMemberDetail::Rar13 {
+            method,
+            unpack_version,
+            file_checksum,
+            has_file_comment,
+            ..
+        } => {
+            detail.insert("method".to_string(), method.to_string());
+            detail.insert("unpack_version".to_string(), unpack_version.to_string());
+            detail.insert("file_checksum".to_string(), file_checksum.to_string());
+            detail.insert("has_file_comment".to_string(), has_file_comment.to_string());
+        }
+        rars_rs::ArchiveMemberDetail::Rar15To40 {
+            method,
+            unpack_version,
+            crc32,
+            salt,
+            has_file_comment,
+            ..
+        } => {
+            crc = Some(crc32);
+            detail.insert("method".to_string(), method.to_string());
+            detail.insert("unpack_version".to_string(), unpack_version.to_string());
+            detail.insert("has_salt".to_string(), salt.is_some().to_string());
+            detail.insert("has_file_comment".to_string(), has_file_comment.to_string());
+        }
+        rars_rs::ArchiveMemberDetail::Rar50Plus {
+            compression_info,
+            crc32,
+            hash,
+            ..
+        } => {
+            crc = crc32;
+            detail.insert("compression_info".to_string(), compression_info.to_string());
+            detail.insert("hash".to_string(), hash_label(hash));
+        }
+        _ => {
+            detail.insert("kind".to_string(), "unknown".to_string());
+        }
+    }
+    let date_time = member
+        .meta
+        .stored_modification_time()
+        .and_then(rars_rs::StoredTimestamp::calendar_fields);
+    RarInfo {
+        member_index: 0,
+        archive_identity: None,
+        filename,
+        orig_filename_bytes: member.meta.name.into(),
+        file_size: member.meta.unpacked_size,
+        compress_size: member.meta.packed_size,
+        date_time,
+        crc,
+        host_os: member.meta.host_os,
+        is_encrypted: member.meta.is_encrypted,
+        is_solid: solid,
+        is_split_before: member.meta.is_split_before,
+        is_split_after: member.meta.is_split_after,
+        rar_version: family_name(member.meta.family).to_string(),
+        file_attr: member.meta.file_attr,
+        detail,
+        is_directory: member.meta.is_directory,
+    }
+}
+
+fn hash_label(hash: Option<rars_rs::ArchiveMemberHash>) -> String {
+    match hash {
+        Some(rars_rs::ArchiveMemberHash::Blake2sp(_)) => "blake2sp".to_string(),
+        Some(rars_rs::ArchiveMemberHash::Other { hash_type, .. }) => format!("other:{hash_type}"),
+        Some(_) => "unknown".to_string(),
+        None => "none".to_string(),
+    }
+}
+
+fn family_name(family: rars_rs::ArchiveFamily) -> &'static str {
+    match family {
+        rars_rs::ArchiveFamily::Rar13 => "rar13",
+        rars_rs::ArchiveFamily::Rar15To40 => "rar15_40",
+        rars_rs::ArchiveFamily::Rar50Plus => "rar50_plus",
+        _ => "unknown",
+    }
+}
+
+fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
+    rars_rs::ArchiveVersion::from_name(value)
+        .ok_or_else(|| PyValueError::new_err(format!("unsupported RAR format: {value}")))
+}
+
+fn checked_output_path(
+    out_dir: &Path,
+    meta: &rars_rs::ExtractedEntryMeta,
+    family: rars_rs::ArchiveFamily,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+) -> rars_rs::Result<PathBuf> {
+    // Retain the binding's conservative name preflight (including legacy
+    // backslash traversal) before applying host-aware destination conversion.
+    rars_rs::validate_entry_name(meta.name.clone())?;
+    let rar50 = family == rars_rs::ArchiveFamily::Rar50Plus;
+    let name = if rar50 && cfg!(unix) && meta.attr_source == rars_rs::AttrSource::Unix {
+        rars_rs::filename::decode_rar50(&meta.name).into_owned()
+    } else if rar50 {
+        meta.name
+            .iter()
+            .map(|&b| if b == b'\\' { b'_' } else { b })
+            .collect()
+    } else {
+        rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
+    };
+    let rel = output_relative_path(&name, !rar50)?;
+    rars_rs::filename::checked_output_path(out_dir, &rel)
+}
+
+fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| PyValueError::new_err("input path has no file name"))?;
+    rars_rs::filename::native_bytes(file_name)
+        .map(<[u8]>::to_vec)
+        .map_err(map_error)
+}
+
+#[cfg(unix)]
+fn set_no_follow(options: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn set_no_follow(_options: &mut fs::OpenOptions) {}
+
+fn legacy_volume_part_path(first_path: &Path, index: usize) -> PyResult<PathBuf> {
+    if index == 0 {
+        return Ok(first_path.to_path_buf());
+    }
+    if index > 100 {
+        return Err(PyValueError::new_err(
+            "legacy RAR volume names only support .r00 through .r99",
+        ));
+    }
+    Ok(first_path.with_extension(format!("r{:02}", index - 1)))
+}
+
+fn rar50_volume_part_path(
+    first_path: &Path,
+    index: usize,
+    total_parts: usize,
+) -> PyResult<PathBuf> {
+    let parent = first_path.parent().unwrap_or_else(|| Path::new(""));
+    let file_name = first_path
+        .file_name()
+        .ok_or_else(|| PyValueError::new_err("RAR 5 volume path needs a file name"))?
+        .to_string_lossy();
+    let stem = rar50_volume_stem(&file_name);
+    let width = total_parts.to_string().len().max(2);
+    Ok(parent.join(format!(
+        "{stem}.part{:0width$}.rar",
+        index + 1,
+        width = width
+    )))
+}
+
+fn rar50_volume_stem(file_name: &str) -> &str {
+    let without_rar = file_name
+        .strip_suffix(".rar")
+        .or_else(|| file_name.strip_suffix(".RAR"))
+        .unwrap_or(file_name);
+    if let Some((base, digits)) = without_rar.rsplit_once(".part") {
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return base;
+        }
+    }
+    without_rar
+}
+
+fn map_io_error(error: io::Error) -> PyErr {
+    PyOSError::new_err(error.to_string())
+}
+
+fn map_error(error: rars_rs::Error) -> PyErr {
+    let message = error.to_string();
+    if error_is_need_password(&error) {
+        return PasswordRequired::new_err(message);
+    }
+    if error_is_bad_password(&error) {
+        return BadPassword::new_err(message);
+    }
+    use rars_rs::ErrorKind;
+    match error.kind() {
+        ErrorKind::UnsupportedFormat | ErrorKind::UnsupportedFeature => {
+            UnsupportedRarFeature::new_err(message)
+        }
+        ErrorKind::UnsafePath => UnsafeArchivePath::new_err(message),
+        ErrorKind::Io | ErrorKind::SourceChanged => PyOSError::new_err(message),
+        ErrorKind::InvalidArgument | ErrorKind::DuplicateEntry => PyValueError::new_err(message),
+        ErrorKind::EntryNotFound => PyKeyError::new_err(message),
+        ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
+        ErrorKind::Cancelled => PyInterruptedError::new_err(message),
+        ErrorKind::WriterFailure => pyo3::exceptions::PyRuntimeError::new_err(message),
+        _ => BadRarFile::new_err(message),
+    }
+}
+
+fn error_is_need_password(error: &rars_rs::Error) -> bool {
+    error.kind() == rars_rs::ErrorKind::PasswordRequired
+}
+
+fn error_is_bad_password(error: &rars_rs::Error) -> bool {
+    error.kind() == rars_rs::ErrorKind::BadPassword
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_preserves_rar5_member_solid_flags() {
+        for version in [
+            rars_rs::ArchiveVersion::Rar50,
+            rars_rs::ArchiveVersion::Rar70,
+        ] {
+            let mut builder = rars_rs::Builder::new(version).solid(true);
+            for name in [b"first".as_slice(), b"second".as_slice()] {
+                builder
+                    .add_bytes(name.to_vec(), b"repeated payload ".repeat(4), None, None)
+                    .unwrap();
+            }
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let flags: Vec<_> = archive
+                .members()
+                .map(|member| info_from_member(member).is_solid)
+                .collect();
+            assert_eq!(flags, [false, true], "{version:?}");
+        }
+    }
+
+    #[test]
+    fn binding_boundary_values_and_error_mappings_preserve_their_contracts() {
+        Python::initialize();
+        Python::attach(|py| {
+            let mut event = ProgressEvent {
+                phase: "writing".into(),
+                completed: 0,
+                total: 0,
+                pass_number: 1,
+                entry_name: None,
+                entry_index: None,
+                total_entries: None,
+                finished: false,
+            };
+            assert_eq!(event.percentage(), None);
+            event.finished = true;
+            assert_eq!(event.percentage(), Some(100.0));
+            event.completed = u64::MAX;
+            event.total = u64::MAX;
+            assert_eq!(event.percentage(), Some(100.0));
+            let token = CancellationToken::new();
+            assert!(!token.is_cancelled());
+            token.cancel();
+            assert!(token.is_cancelled());
+            assert_eq!(
+                hash_label(Some(rars_rs::ArchiveMemberHash::Other {
+                    hash_type: 42,
+                    data: vec![1, 2],
+                })),
+                "other:42"
+            );
+            for error in [
+                rars_rs::Error::EntryNotFound,
+                rars_rs::Error::DuplicateEntry,
+                rars_rs::Error::InputSymlink,
+            ] {
+                let mapped = map_builder_error(error);
+                assert!(!mapped.to_string().is_empty());
+            }
+            let symlink = map_builder_error(
+                rars_rs::Error::InputSymlink.at_entry(b"link".to_vec(), "adding"),
+            );
+            assert!(symlink.is_instance_of::<PyValueError>(py));
+            assert!(symlink.to_string().contains("link"));
+            for (name, separator, expected) in [
+                (&b"./nested/./file"[..], false, Some("nested/file")),
+                (&b"nested\\file"[..], true, Some("nested/file")),
+                (&b""[..], false, None),
+                (&b"."[..], false, None),
+                (&b"nul\0file"[..], false, None),
+                (&b"C:file"[..], false, None),
+                (&b"/absolute"[..], false, None),
+                (&b"../parent"[..], false, None),
+            ] {
+                let result = output_relative_path(name, separator);
+                match expected {
+                    Some(expected) => assert_eq!(result.unwrap(), PathBuf::from(expected)),
+                    None => assert!(result.is_err()),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn progress_suppresses_reports_after_either_cancellation_signal() {
+        use rars_rs::WriteProgress;
+        let event = rars_rs::WriteProgressEvent::Advanced {
+            operation: rars_rs::WriteOperation::Emission,
+            completed_bytes: 1,
+            total_bytes: 2,
+            pass: 1,
+        };
+        let progress = PythonProgress::new(None, None);
+        progress.report(event);
+        assert!(progress.state.lock().unwrap().is_empty());
+        progress.cancelled.store(true, Ordering::Relaxed);
+        progress.report(event);
+        assert!(progress.is_cancelled());
+        let token = CancellationToken::new();
+        let progress = PythonProgress::new(None, Some(&token));
+        token.cancel();
+        progress.report(event);
+        assert!(progress.is_cancelled());
+        assert!(progress.state.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_recovers_poisoned_state_and_preserves_callback_exceptions() {
+        use rars_rs::WriteProgress;
+        Python::initialize();
+        Python::attach(|py| {
+            let callback = py.eval(c"lambda event: None", None, None).unwrap().unbind();
+            let progress = PythonProgress::new(Some(callback), None);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = progress.state.lock().unwrap();
+                panic!("poison progress state");
+            }));
+            progress.report(rars_rs::WriteProgressEvent::OperationStarted {
+                operation: rars_rs::WriteOperation::Emission,
+                total_bytes: None,
+                total_entries: None,
+                pass: 2,
+            });
+            assert!(!progress.is_cancelled());
+            assert!(progress.take_error().is_none());
+            let callback = py
+                .eval(c"lambda event: 1 / 0", None, None)
+                .unwrap()
+                .unbind();
+            let progress = PythonProgress::new(Some(callback), None);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = progress.error.lock().unwrap();
+                panic!("poison progress error");
+            }));
+            progress.report(rars_rs::WriteProgressEvent::Advanced {
+                operation: rars_rs::WriteOperation::Emission,
+                completed_bytes: 1,
+                total_bytes: 2,
+                pass: 1,
+            });
+            assert!(progress.is_cancelled());
+            assert!(progress
+                .take_error()
+                .unwrap()
+                .is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
+            assert!(progress.take_error().is_none());
+        });
+    }
+
+    #[test]
+    fn deferred_sink_flush_materializes_empty_files_and_reuses_open_file() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!(
+                "python-deferred-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("nested/file");
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let file = std::rc::Rc::new(std::cell::RefCell::new(DeferredExtractedFile {
+            path: path.clone(),
+            overwrite: false,
+            file: None,
+            written: written.clone(),
+        }));
+        let mut sink = DeferredExtractedSink(file);
+        sink.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        sink.write_all(b"payload").unwrap();
+        sink.flush().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"payload");
+        assert_eq!(*written.lock().unwrap(), vec![path]);
+        drop(sink);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_parse_cancellation_does_not_enter_damaged_header_fallback() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let error = repair_core(b"not an archive", None, Some(&token)).unwrap_err();
+        assert_eq!(error.kind(), rars_rs::ErrorKind::Cancelled);
+    }
+
+    #[test]
+    fn reader_workspace_options_reach_the_decoder_and_raise_memory_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let kwargs = pyo3::types::PyDict::new(py);
+            kwargs.set_item("max_reader_workspace_bytes", 1u64).unwrap();
+            let object = py
+                .get_type::<ReadOptions>()
+                .call((), Some(&kwargs))
+                .unwrap();
+            assert_eq!(
+                object
+                    .getattr("max_reader_workspace_bytes")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+            let settings = object.extract::<PyRef<'_, ReadOptions>>().unwrap();
+            let options = python_read_options(Some(&settings), None);
+            assert_eq!(options.max_reader_workspace_bytes, Some(1));
+            let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50);
+            builder
+                .add_bytes(
+                    b"file".to_vec(),
+                    b"compressed payload".repeat(32),
+                    None,
+                    None,
+                )
+                .unwrap();
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let error = map_error(archive.test_with_options(options).unwrap_err());
+            assert!(error.is_instance_of::<PyMemoryError>(py));
+        });
+    }
+
+    #[test]
+    fn python_thread_cancels_an_in_progress_read_without_a_callback() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Paused {
+            input: Cursor<Vec<u8>>,
+            armed: Arc<AtomicBool>,
+            started: mpsc::Sender<()>,
+            resume: mpsc::Receiver<()>,
+        }
+        impl Read for Paused {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.armed.swap(false, Ordering::Relaxed) {
+                    self.started.send(()).map_err(io::Error::other)?;
+                    self.resume
+                        .recv_timeout(Duration::from_secs(10))
+                        .map_err(io::Error::other)?;
+                }
+                self.input.read(buffer)
+            }
+        }
+        impl Seek for Paused {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                self.input.seek(from)
+            }
+        }
+        Python::initialize();
+        Python::attach(|py| {
+            for format in [
+                rars_rs::ArchiveVersion::Rar14,
+                rars_rs::ArchiveVersion::Rar29,
+                rars_rs::ArchiveVersion::Rar50,
+            ] {
+                let mut builder = rars_rs::Builder::new(format).store(true);
+                builder
+                    .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                    .unwrap();
+                let armed = Arc::new(AtomicBool::new(false));
+                let (started, waiting) = mpsc::channel();
+                let (resume, resumed) = mpsc::channel();
+                let archive = rars_rs::ArchiveReader::read_reader(Paused {
+                    input: Cursor::new(builder.to_bytes().unwrap()),
+                    armed: armed.clone(),
+                    started,
+                    resume: resumed,
+                })
+                .unwrap();
+                let file = RarFile {
+                    identity: Arc::new(()),
+                    encoding: None,
+                    infos: archive.members().map(info_from_member).collect(),
+                    names: OnceLock::new(),
+                    archive,
+                    password: None,
+                };
+                let token = CancellationToken::new();
+                let options =
+                    ReadOptions::new(Some(&token), None, None, None, None, None, None, None, None)
+                        .unwrap();
+                let cancel_object = Py::new(py, token).unwrap();
+                armed.store(true, Ordering::Relaxed);
+                let worker = std::thread::spawn(move || {
+                    waiting.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Python::attach(|py| {
+                        cancel_object.bind(py).call_method0("cancel").unwrap();
+                    });
+                    resume.send(()).unwrap();
+                });
+                let name = PyBytes::new(py, b"file");
+                let error = file
+                    .read(py, name.as_any(), None, Some(&options))
+                    .unwrap_err();
+                py.detach(|| worker.join().unwrap());
+                assert!(
+                    error.is_instance_of::<PyInterruptedError>(py),
+                    "{format}: {error}"
+                );
+                assert_eq!(
+                    file.read(py, name.as_any(), None, None).unwrap(),
+                    b"payload"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn selected_extraction_preserves_solid_password_dependencies() {
+        let root = scratch::case("selected-solid-extraction");
+        for format in [
+            rars_rs::ArchiveVersion::Rar29,
+            rars_rs::ArchiveVersion::Rar50,
+        ] {
+            let mut builder = rars_rs::Builder::new(format).solid(true);
+            for name in [b"first".as_slice(), b"secret", b"last"] {
+                builder
+                    .add_bytes(name.to_vec(), name.repeat(100), None, None)
+                    .unwrap();
+            }
+            builder
+                .set_entry_encryption(b"secret", Some(b"password".to_vec()), None)
+                .unwrap();
+            let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let directory = root.join(format.to_string());
+            let first = b"first".to_vec();
+            let last = b"last".to_vec();
+            let paths = extract_archive(
+                &archive,
+                Some(&first),
+                &directory,
+                rars_rs::ArchiveReadOptions::new(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(paths, vec![directory.join("first")]);
+            assert_eq!(fs::read(&paths[0]).unwrap(), first.repeat(100));
+            let error = extract_archive(
+                &archive,
+                Some(&last),
+                &directory,
+                rars_rs::ArchiveReadOptions::new(),
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), rars_rs::ErrorKind::PasswordRequired);
+            assert!(!directory.join("last").exists());
+            let paths = extract_archive(
+                &archive,
+                Some(&last),
+                &directory,
+                rars_rs::ArchiveReadOptions::with_password(b"password"),
+                false,
+            )
+            .unwrap();
+            assert_eq!(paths, vec![directory.join("last")]);
+            assert_eq!(fs::read(&paths[0]).unwrap(), last.repeat(100));
+        }
+    }
+
+    #[test]
+    fn python_rewrite_batches_link_metadata_and_stages_one_pass_per_write() {
+        use rars_rs::atomic64::AtomicU64;
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+
+        struct Counted {
+            input: Cursor<Vec<u8>>,
+            bytes: Arc<AtomicU64>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = self.input.read(buffer)?;
+                self.bytes.fetch_add(read as u64, Ordering::Relaxed);
+                Ok(read)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                self.input.seek(from)
+            }
+        }
+
+        let root = scratch::case("python-rewrite-once");
+        Python::initialize();
+        Python::attach(|py| {
+            for with_links in [false, true] {
+                for format in rars_rs::ArchiveVersion::ALL {
+                    if with_links
+                        && !matches!(
+                            format,
+                            rars_rs::ArchiveVersion::Rar20
+                                | rars_rs::ArchiveVersion::Rar29
+                                | rars_rs::ArchiveVersion::Rar30
+                                | rars_rs::ArchiveVersion::Rar40
+                        )
+                    {
+                        continue;
+                    }
+                    let mut input = rars_rs::Builder::new(format).solid(true);
+                    for name in [b"first", b"other", b"final"] {
+                        input
+                            .add_bytes(name.to_vec(), name.repeat(100), None, None)
+                            .unwrap();
+                        if with_links && name != b"final" {
+                            input
+                                .add_unix_symlink(
+                                    [name.as_slice(), b"-link"].concat(),
+                                    b"../missing-\xff".to_vec(),
+                                    false,
+                                    None,
+                                    None,
+                                )
+                                .unwrap();
+                        }
+                    }
+                    let bytes = Arc::new(AtomicU64::new(0));
+                    let archive = rars_rs::ArchiveReader::read_reader(Counted {
+                        input: Cursor::new(input.to_bytes().unwrap()),
+                        bytes: bytes.clone(),
+                    })
+                    .unwrap();
+                    bytes.store(0, Ordering::Relaxed);
+                    archive
+                        .extract_with_control(rars_rs::ArchiveReadOptions::default(), |_| {
+                            Ok(rars_rs::ExtractionDecision::Extract(Box::new(io::sink())))
+                        })
+                        .unwrap();
+                    let one_pass = bytes.swap(0, Ordering::Relaxed);
+                    let metadata_pass = if with_links {
+                        archive
+                            .extract_with_control(
+                                rars_rs::ArchiveReadOptions::default(),
+                                |member| {
+                                    if member.meta.name == b"final" {
+                                        Ok(rars_rs::ExtractionDecision::Stop)
+                                    } else {
+                                        Ok(rars_rs::ExtractionDecision::Extract(Box::new(
+                                            io::sink(),
+                                        )))
+                                    }
+                                },
+                            )
+                            .unwrap();
+                        bytes.swap(0, Ordering::Relaxed)
+                    } else {
+                        0
+                    };
+                    // Both the diagnostic preflight and preserving_builder
+                    // validate the small producer payload. Neither should read
+                    // member data beyond the single link metadata pass.
+                    let producer_checks = archive.as_rar50().map_or(0, |archive| {
+                        2 * archive
+                            .services()
+                            .filter(|service| service.name == b"RARS")
+                            .map(|service| service.packed_size())
+                            .sum::<u64>()
+                    }) + archive.as_rar15_40().map_or(0, |archive| {
+                        2 * archive
+                            .new_subs()
+                            .filter(|sub| sub.file.name == b"RARS")
+                            .map(|sub| sub.file.pack_size)
+                            .sum::<u64>()
+                    });
+                    let source = Py::new(
+                        py,
+                        RarFile {
+                            identity: Arc::new(()),
+                            encoding: None,
+                            archive,
+                            password: None,
+                            infos: Vec::new(),
+                            names: OnceLock::new(),
+                        },
+                    )
+                    .unwrap();
+                    let directory = pyo3::types::PyString::new(py, root.to_str().unwrap());
+                    let builder = RarBuilder::from_archive(
+                        py,
+                        source.bind(py).as_any(),
+                        None,
+                        true,
+                        Some(directory.as_any()),
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        bytes.swap(0, Ordering::Relaxed),
+                        metadata_pass + producer_checks,
+                        "{format}: only one link metadata pass is allowed"
+                    );
+                    for _ in 0..2 {
+                        let output = builder.to_bytes(py, None, None).unwrap();
+                        assert_eq!(bytes.swap(0, Ordering::Relaxed), one_pass, "{format}");
+                        let output =
+                            rars_rs::ArchiveReader::read_owned(output.bind(py).as_bytes().to_vec())
+                                .unwrap();
+                        assert_eq!(
+                            output.read_member(b"final", None).unwrap().unwrap(),
+                            b"final".repeat(100)
+                        );
+                        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn python_exception_types_and_messages_survive_nested_context() {
+        use rars_rs::Error as CoreError;
+        Python::initialize();
+        Python::attach(|py| {
+            let cases = [
+                CoreError::from(io::Error::from(io::ErrorKind::PermissionDenied)),
+                CoreError::UnsupportedCompression {
+                    family: "RAR",
+                    unpack_version: 99,
+                    method: 1,
+                },
+                CoreError::MemoryLimitExceeded {
+                    limit: 1,
+                    required: 2,
+                    dictionary_size: 1,
+                },
+                CoreError::Cancelled,
+                CoreError::WriterFailure("layout failure"),
+                CoreError::UnsafePath("refused path"),
+                CoreError::InvalidArgument("bad option"),
+                CoreError::InvalidHeader("unsafe; a password is required; I/O error"),
+                CoreError::NeedPassword,
+                CoreError::Rar50Crypto(rars_rs::crypto::rar50::Error::BadPassword),
+            ];
+            for cause in cases {
+                let kind = cause.kind();
+                let wrapped = CoreError::InVolume {
+                    number: 2,
+                    source: Box::new(
+                        cause
+                            .at_entry(b"member".to_vec(), "reading")
+                            .at_archive_offset(7),
+                    ),
+                };
+                let exception = map_error(wrapped);
+                let matches = match kind {
+                    rars_rs::ErrorKind::Io => exception.is_instance_of::<PyOSError>(py),
+                    rars_rs::ErrorKind::UnsupportedFeature => {
+                        exception.is_instance_of::<UnsupportedRarFeature>(py)
+                    }
+                    rars_rs::ErrorKind::ResourceLimit => {
+                        exception.is_instance_of::<PyMemoryError>(py)
+                    }
+                    rars_rs::ErrorKind::Cancelled => {
+                        exception.is_instance_of::<PyInterruptedError>(py)
+                    }
+                    rars_rs::ErrorKind::WriterFailure => {
+                        exception.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)
+                    }
+                    rars_rs::ErrorKind::UnsafePath => {
+                        exception.is_instance_of::<UnsafeArchivePath>(py)
+                    }
+                    rars_rs::ErrorKind::InvalidArgument => {
+                        exception.is_instance_of::<PyValueError>(py)
+                    }
+                    rars_rs::ErrorKind::PasswordRequired => {
+                        exception.is_instance_of::<PasswordRequired>(py)
+                    }
+                    rars_rs::ErrorKind::BadPassword => exception.is_instance_of::<BadPassword>(py),
+                    _ => exception.is_instance_of::<BadRarFile>(py),
+                };
+                assert!(matches, "{kind:?}: {exception}");
+                assert!(exception.to_string().contains("in volume 2"));
+                assert!(exception.to_string().contains("member"));
+            }
+            let missing = CoreError::InVolume {
+                number: 2,
+                source: Box::new(CoreError::EntryNotFound.at_entry(b"gone".to_vec(), "removing")),
+            };
+            assert!(map_builder_error(missing).is_instance_of::<PyKeyError>(py));
+        });
+    }
+
+    #[test]
+    fn password_classification_survives_volume_context() {
+        use rars_rs::Error;
+        for (cause, needs_password, bad_password) in [
+            (Error::NeedPassword, true, false),
+            (Error::WrongPasswordOrCorruptData, false, true),
+            (Error::InvalidHeader("broken header"), false, false),
+        ] {
+            let volume = Error::InVolume {
+                number: 2,
+                source: Box::new(cause.clone()),
+            };
+            let nested = Error::AtEntry {
+                name: b"file".to_vec(),
+                operation: "extracting",
+                source: Box::new(Error::AtArchiveOffset {
+                    offset: 123,
+                    source: Box::new(volume.clone()),
+                }),
+            };
+            for error in [cause, volume, nested] {
+                assert_eq!(error_is_need_password(&error), needs_password, "{error}");
+                assert_eq!(error_is_bad_password(&error), bad_password, "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn parses_python_version_names() {
+        assert_eq!(
+            parse_version("rar5").unwrap(),
+            rars_rs::ArchiveVersion::Rar50
+        );
+        assert_eq!(
+            parse_version("rar70").unwrap(),
+            rars_rs::ArchiveVersion::Rar70
+        );
+        assert!(parse_version("zip").is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_archive_names() {
+        assert!(rars_rs::validate_entry_name(b"dir/file.txt".to_vec()).is_ok());
+        assert!(rars_rs::validate_entry_name(b"../file.txt".to_vec()).is_err());
+        assert!(rars_rs::validate_entry_name(b"/tmp/file.txt".to_vec()).is_err());
+        assert!(rars_rs::validate_entry_name(b"C:/file.txt".to_vec()).is_err());
+    }
+
+    #[test]
+    fn builder_creates_readable_rar50_bytes() {
+        let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50)
+            .compression_level(Some(0))
+            .store(true)
+            .comment(Some(b"comment".to_vec()));
+        builder
+            .add_bytes(b"hello.txt".to_vec(), b"hello".to_vec(), None, None)
+            .unwrap();
+
+        let bytes = builder.to_bytes().unwrap();
+        let archive = rars_rs::ArchiveReader::read_owned(bytes).unwrap();
+        let names: Vec<_> = archive.members().map(|member| member.meta.name).collect();
+        assert_eq!(names, vec![b"hello.txt".to_vec()]);
+    }
+
+    #[test]
+    fn classifies_the_builder_refusals_python_reports_as_argument_errors() {
+        let mut builder = rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"a".to_vec(), vec![], None, None)
+            .unwrap();
+        assert_eq!(
+            classify_builder_error(
+                &builder
+                    .add_bytes(b"a".to_vec(), vec![], None, None)
+                    .unwrap_err()
+            ),
+            BuilderRefusal::DuplicateName
+        );
+        assert_eq!(
+            classify_builder_error(&builder.remove(b"gone").unwrap_err()),
+            BuilderRefusal::NoSuchEntry
+        );
+        assert_eq!(
+            classify_builder_error(&builder.rename(b"gone", b"x".to_vec()).unwrap_err()),
+            BuilderRefusal::NoSuchEntry
+        );
+        // An unsafe name is not one of the three; it keeps reaching
+        // `UnsafeArchivePath` through the general mapping.
+        assert_eq!(
+            classify_builder_error(
+                &builder
+                    .add_bytes(b"../escape".to_vec(), vec![], None, None)
+                    .unwrap_err()
+            ),
+            BuilderRefusal::Other
+        );
+    }
+}
